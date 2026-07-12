@@ -24,7 +24,7 @@ import streamlit as st
 # ----------------------------------------------------------------------------
 # PAGE CONFIG
 # ----------------------------------------------------------------------------
-st.set_page_config(page_title="DCI Dashboard - BPCL Uran", layout="wide")
+st.set_page_config(page_title="DCI Project Hub", layout="wide")
 
 
 APPROVED_CODES = {"1", "1 WITH COMMENTS"}
@@ -836,28 +836,114 @@ def inspect_workbook_bytes(file_bytes):
 # ----------------------------------------------------------------------------
 # IMPORT WORKFLOW (Supabase writes)
 # ----------------------------------------------------------------------------
-def find_import_by_hash(supabase, file_hash):
-    res = (
+def find_import_by_hash(supabase, file_hash, project_id=None):
+    query = (
         supabase.table("imports")
         .select("*")
         .eq("workbook_hash", file_hash)
         .eq("is_active", True)
-        .order("uploaded_at", desc=True)
-        .limit(1)
-        .execute()
     )
+    if project_id is not None:
+        query = query.eq("project_id", project_id)
+    res = query.order("uploaded_at", desc=True).limit(1).execute()
     return res.data[0] if res.data else None
 
 
-def list_imports(supabase):
-    res = (
+def list_imports(supabase, project_id=None):
+    query = (
         supabase.table("imports")
         .select("*")
         .eq("is_active", True)
-        .order("uploaded_at", desc=True)
+    )
+    if project_id is not None:
+        query = query.eq("project_id", project_id)
+    res = query.order("uploaded_at", desc=True).execute()
+    return res.data or []
+
+
+def list_projects(supabase):
+    res = (
+        supabase.table("projects")
+        .select("*")
+        .eq("is_active", True)
+        .order("created_at", desc=True)
         .execute()
     )
     return res.data or []
+
+
+def get_project(supabase, project_id):
+    res = supabase.table("projects").select("*").eq("id", project_id).single().execute()
+    return res.data
+
+
+def list_templates(supabase):
+    res = (
+        supabase.table("dci_templates")
+        .select("*")
+        .eq("is_active", True)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return res.data or []
+
+
+def create_template(supabase, *, name, file_bytes, filename, description=""):
+    """Validate, store, and register a reusable DCI template."""
+    _ws, layout, diagnostics = inspect_workbook_bytes(file_bytes)
+    template_row = {
+        "template_name": str(name).strip() or filename,
+        "description": str(description or "").strip(),
+        "original_filename": filename,
+        "storage_bucket": STORAGE_BUCKET,
+        "storage_path": "pending",
+        "workbook_hash": workbook_hash(file_bytes),
+        "engine_version": int(layout.get("engine_version", TEMPLATE_ENGINE_VERSION)),
+        "layout_definition": layout,
+        "is_active": True,
+    }
+    created = supabase.table("dci_templates").insert(template_row).execute()
+    if not created.data:
+        raise RuntimeError("Supabase did not return the new template row.")
+    template_id = created.data[0]["id"]
+    path = f"templates/{template_id}/template.xlsx"
+    try:
+        supabase.storage.from_(STORAGE_BUCKET).upload(
+            path=path,
+            file=file_bytes,
+            file_options={
+                "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "upsert": "true",
+            },
+        )
+        supabase.table("dci_templates").update({"storage_path": path}).eq("id", template_id).execute()
+        return template_id, diagnostics
+    except Exception:
+        supabase.table("dci_templates").update({"is_active": False}).eq("id", template_id).execute()
+        raise
+
+
+def create_project(supabase, *, project_name, contractor, client, review_period_days, template_id):
+    row = {
+        "project_name": str(project_name).strip(),
+        "contractor": str(contractor or "").strip() or None,
+        "client": str(client or "").strip() or None,
+        "review_period_days": int(review_period_days),
+        "template_id": template_id,
+        "is_active": True,
+    }
+    created = supabase.table("projects").insert(row).execute()
+    if not created.data:
+        raise RuntimeError("Supabase did not return the new project row.")
+    st.cache_data.clear()
+    return created.data[0]
+
+
+def get_template_bytes(supabase, template_id):
+    row = supabase.table("dci_templates").select("*").eq("id", template_id).single().execute().data
+    if not row:
+        raise ValueError("The selected template no longer exists.")
+    return supabase.storage.from_(row.get("storage_bucket") or STORAGE_BUCKET).download(row["storage_path"]), row
 
 
 def upload_workbook_to_storage(supabase, import_id, file_bytes, filename):
@@ -874,7 +960,8 @@ def upload_workbook_to_storage(supabase, import_id, file_bytes, filename):
 
 
 def run_import(supabase, file_bytes, filename, project_name, contractor,
-                review_period_days, version_mode, parent_import_id=None):
+                review_period_days, version_mode, parent_import_id=None,
+                project_id=None, template_id=None):
     """Import a workbook without deactivating the current version prematurely.
 
     Supabase/PostgREST calls are not a single database transaction from Python, so
@@ -901,6 +988,8 @@ def run_import(supabase, file_bytes, filename, project_name, contractor,
             version_number = int(parent.data[0].get("version_number") or 1) + 1
 
     import_row = {
+        "project_id": project_id,
+        "template_id": template_id,
         "original_filename": filename,
         "display_name": filename,
         "project_name": project_name or wb_project_name,
@@ -1853,12 +1942,172 @@ if supabase is None:
     st.stop()
 
 # ----------------------------------------------------------------------------
+# PROJECT HOME / PROJECT SELECTION
+# ----------------------------------------------------------------------------
+def _clear_pending_upload():
+    for key in (
+        "pending_upload_bytes", "pending_upload_name", "create_project_template_bytes",
+        "create_project_template_name",
+    ):
+        st.session_state.pop(key, None)
+
+
+def render_project_home(supabase):
+    st.title("DCI Project Home")
+    st.caption("Open an existing project or create a new one from a reusable Excel template.")
+
+    projects = list_projects(supabase)
+    if projects:
+        st.subheader("Projects")
+        cards_per_row = 3
+        for start in range(0, len(projects), cards_per_row):
+            cols = st.columns(cards_per_row)
+            for col, project in zip(cols, projects[start:start + cards_per_row]):
+                with col.container(border=True):
+                    st.markdown(f"### {project.get('project_name') or 'Unnamed Project'}")
+                    details = []
+                    if project.get("client"):
+                        details.append(f"Client: {project['client']}")
+                    if project.get("contractor"):
+                        details.append(f"Contractor: {project['contractor']}")
+                    if details:
+                        st.caption("  \n".join(details))
+                    p_imports = list_imports(supabase, project["id"])
+                    latest = p_imports[0] if p_imports else None
+                    if latest:
+                        st.metric("Documents", int(latest.get("row_count") or 0))
+                        st.caption(f"Latest workbook: {latest.get('display_name') or latest.get('original_filename')}")
+                    else:
+                        st.metric("Documents", 0)
+                        st.caption("Template ready · no workbook imported yet")
+                    if st.button("Open Project", key=f"open_project_{project['id']}", type="primary", use_container_width=True):
+                        st.session_state["active_project_id"] = project["id"]
+                        st.session_state["show_project_home"] = False
+                        _clear_pending_upload()
+                        st.rerun()
+    else:
+        st.info("No projects exist yet. Create the first project below.")
+
+    st.markdown("---")
+    st.subheader("＋ Create New Project")
+    with st.container(border=True):
+        project_name = st.text_input("Project name *", key="new_project_name")
+        c1, c2, c3 = st.columns(3)
+        contractor = c1.text_input("Contractor", key="new_project_contractor")
+        client = c2.text_input("Client", key="new_project_client")
+        review_days = c3.number_input(
+            "Allowed EIL review period (days)", min_value=1, max_value=90, value=21,
+            key="new_project_review_days",
+        )
+
+        templates = list_templates(supabase)
+        template_mode_options = ["Upload a new template"]
+        if templates:
+            template_mode_options.insert(0, "Use an existing template")
+        template_mode = st.radio("Template source", template_mode_options, horizontal=True)
+
+        selected_template_id = None
+        uploaded_template = None
+        template_name = ""
+        template_description = ""
+        if template_mode == "Use an existing template":
+            template_labels = {
+                f"{t['template_name']} · {t.get('original_filename') or 'Excel template'}": t["id"]
+                for t in templates
+            }
+            selected_label = st.selectbox("Choose template", list(template_labels.keys()))
+            selected_template_id = template_labels[selected_label]
+            selected = next(t for t in templates if t["id"] == selected_template_id)
+            st.caption(selected.get("description") or "This template will define the workbook structure for the project.")
+        else:
+            template_name = st.text_input("Template name *", placeholder="Example: Standard BPCL DCI Template")
+            template_description = st.text_area("Template description", height=80)
+            uploaded_template = st.file_uploader(
+                "Upload an empty template or a normal populated DCI workbook (.xlsx)",
+                type=["xlsx"], key="create_project_template_uploader",
+            )
+            if uploaded_template is not None:
+                try:
+                    _ws, _layout, diagnostic = inspect_workbook_bytes(uploaded_template.getvalue())
+                    st.success(
+                        f"Template detected: sheet {diagnostic['sheet']}, header row "
+                        f"{diagnostic['header_row']}, {len(diagnostic['revision_blocks'])} revision blocks."
+                    )
+                except Exception as exc:
+                    st.error(f"Template discovery failed: {exc}")
+
+        if st.button("Create Project", type="primary", key="create_project_button"):
+            if not str(project_name).strip():
+                st.error("Project name is required.")
+            elif template_mode == "Upload a new template" and uploaded_template is None:
+                st.error("Upload a template workbook before creating the project.")
+            elif template_mode == "Upload a new template" and not str(template_name).strip():
+                st.error("Template name is required.")
+            else:
+                try:
+                    with st.spinner("Creating project..."):
+                        if template_mode == "Upload a new template":
+                            selected_template_id, _diagnostic = create_template(
+                                supabase,
+                                name=template_name,
+                                file_bytes=uploaded_template.getvalue(),
+                                filename=uploaded_template.name,
+                                description=template_description,
+                            )
+                        created_project = create_project(
+                            supabase,
+                            project_name=project_name,
+                            contractor=contractor,
+                            client=client,
+                            review_period_days=review_days,
+                            template_id=selected_template_id,
+                        )
+                    st.session_state["active_project_id"] = created_project["id"]
+                    st.session_state["show_project_home"] = False
+                    _clear_pending_upload()
+                    st.success("Project created.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not create project: {exc}")
+
+
+try:
+    _available_projects = list_projects(supabase)
+except Exception as exc:
+    st.error("The multi-project database migration has not been applied yet.")
+    st.code(str(exc))
+    st.info("Run `project_home_migration.sql` in the Supabase SQL Editor, then reload the app.")
+    st.stop()
+
+if "show_project_home" not in st.session_state:
+    st.session_state["show_project_home"] = st.session_state.get("active_project_id") is None
+
+if st.session_state.get("show_project_home") or st.session_state.get("active_project_id") is None:
+    render_project_home(supabase)
+    st.stop()
+
+active_project_id = st.session_state.get("active_project_id")
+try:
+    active_project = get_project(supabase, active_project_id)
+except Exception:
+    active_project = None
+if not active_project:
+    st.session_state.pop("active_project_id", None)
+    st.session_state["show_project_home"] = True
+    st.rerun()
+
+# ----------------------------------------------------------------------------
 # SIDEBAR
 # ----------------------------------------------------------------------------
 st.sidebar.title("DCI Dashboard")
+if st.sidebar.button("← Project Home", use_container_width=True):
+    st.session_state["show_project_home"] = True
+    _clear_pending_upload()
+    st.rerun()
+st.sidebar.caption(f"Project: **{active_project.get('project_name', 'Unnamed Project')}**")
 
 with st.sidebar.expander("Workbook", expanded=True):
-    imports = list_imports(supabase)
+    imports = list_imports(supabase, active_project_id)
     import_options = {f"{i['display_name']} (v{i['version_number']}, {i['row_count']} docs)": i["id"] for i in imports}
 
     if imports:
@@ -1883,7 +2132,7 @@ with st.sidebar.expander("Workbook", expanded=True):
 
 st.sidebar.markdown("---")
 with st.sidebar.expander("Project Settings", expanded=True):
-    default_review_days = active_import["review_period_days"] if active_import else 21
+    default_review_days = active_import["review_period_days"] if active_import else int(active_project.get("review_period_days") or 21)
     review_period_days = st.number_input(
         "Allowed EIL review period (days)", min_value=1, max_value=90, value=default_review_days
     )
@@ -1998,8 +2247,8 @@ with st.sidebar.expander("Quick Statistics", expanded=False):
 # ----------------------------------------------------------------------------
 # HEADER
 # ----------------------------------------------------------------------------
-project_name = active_import["project_name"] if active_import else None
-contractor = active_import["contractor"] if active_import else None
+project_name = active_import["project_name"] if active_import else active_project.get("project_name")
+contractor = active_import["contractor"] if active_import else active_project.get("contractor")
 
 if has_data:
     as_of_candidates = pd.concat([df["latest_uploaded_date"], df["latest_from_eil_date"]]).dropna()
@@ -2749,14 +2998,25 @@ try:
             st.session_state["pending_upload_name"] = pending_name
 
         if pending_bytes is None:
-            st.caption("No pending upload. Use the uploader above or the sidebar.")
+            st.caption("No pending workbook. Upload a populated workbook above when project documents are ready.")
+            if active_project.get("template_id"):
+                try:
+                    template_bytes, template_meta = get_template_bytes(supabase, active_project["template_id"])
+                    st.download_button(
+                        "Download Project Template",
+                        data=template_bytes,
+                        file_name=template_meta.get("original_filename") or "DCI_Template.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                except Exception as template_exc:
+                    st.warning(f"The project template could not be loaded: {template_exc}")
         else:
             try:
                 _preview_ws, discovered_layout, discovery_info = inspect_workbook_bytes(pending_bytes)
                 records, history, wb_project, wb_contractor = parse_workbook_bytes(pending_bytes)
                 warnings, errors = validate_records(records)
                 file_hash = workbook_hash(pending_bytes)
-                dup = find_import_by_hash(supabase, file_hash)
+                dup = find_import_by_hash(supabase, file_hash, active_project_id)
 
                 st.markdown("#### Preview")
                 p1, p2, p3 = st.columns(3)
@@ -2831,6 +3091,8 @@ try:
                                 new_import_id, import_warnings = run_import(
                                     supabase, pending_bytes, pending_name, wb_project, wb_contractor,
                                     review_period_days, mode, parent_id,
+                                    project_id=active_project_id,
+                                    template_id=active_project.get("template_id"),
                                 )
                             st.session_state.pop("pending_upload_bytes", None)
                             st.session_state.pop("pending_upload_name", None)
