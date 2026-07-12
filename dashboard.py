@@ -782,25 +782,97 @@ EXTRA_EXPORT_HEADERS = {
 }
 
 
+def _is_formula_cell(cell):
+    """Return True when an openpyxl cell contains an Excel formula."""
+    return isinstance(cell.value, str) and cell.value.startswith("=")
+
+
+def _write_preserving_formula(ws, row, column, value):
+    """Write a value only when the target is not an existing formula cell.
+
+    This keeps the workbook's calculation logic intact. Formula-driven summary
+    cells will recalculate from the revision-history blocks when Excel opens.
+    """
+    cell = ws.cell(row=row, column=column)
+    if _is_formula_cell(cell):
+        return False
+    cell.value = value
+    return True
+
+
+def _normalise_revision_for_match(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip().upper()
+
+
+def _find_revision_block(ws, row_number, revision):
+    """Find the existing block for revision, otherwise the first empty block."""
+    wanted = _normalise_revision_for_match(revision)
+    first_empty = None
+
+    for start_col in REV_BLOCK_START_COLS:
+        existing_rev = ws.cell(row=row_number, column=start_col).value
+        existing_upload = ws.cell(row=row_number, column=start_col + 1).value
+        existing_code = ws.cell(row=row_number, column=start_col + 2).value
+        existing_return = ws.cell(row=row_number, column=start_col + 3).value
+
+        if wanted and _normalise_revision_for_match(existing_rev) == wanted:
+            return start_col
+
+        if first_empty is None and all(v in (None, "") for v in (
+            existing_rev, existing_upload, existing_code, existing_return
+        )):
+            first_empty = start_col
+
+    return first_empty
+
+
 def generate_updated_workbook(supabase, import_id):
     import openpyxl
 
     meta = get_import_meta(supabase, import_id)
     original_bytes = supabase.storage.from_(STORAGE_BUCKET).download(meta["original_storage_path"])
+
+    # data_only=False is essential: it loads formula expressions, not cached results.
     wb = openpyxl.load_workbook(io.BytesIO(original_bytes), data_only=False)
     ws = wb["DCI"]
 
-    doc_rows = _fetch_all(supabase.table("documents").select("*").eq("import_id", import_id).eq("is_active", True))
+    doc_rows = _fetch_all(
+        supabase.table("documents").select("*").eq("import_id", import_id).eq("is_active", True)
+    )
 
     extra_start_col = ws.max_column + 1
     header_row = 8
     for i, field in enumerate(EXTRA_EXPORT_COLUMNS):
         ws.cell(row=header_row, column=extra_start_col + i, value=EXTRA_EXPORT_HEADERS[field])
 
+    history_block_warnings = []
     for doc in doc_rows:
         r = doc["original_row_number"]
+
+        # Update summary cells only when they are not formulas. Formula cells are
+        # intentionally retained and will calculate from the history blocks.
         for field, col in EXPORT_CELL_MAP.items():
-            ws.cell(row=r, column=col, value=doc.get(field))
+            _write_preserving_formula(ws, r, col, doc.get(field))
+
+        # Write the current revision into its actual four-column revision block:
+        # revision | revision/upload date | return code | return date.
+        revision = doc.get("revision")
+        if revision not in (None, ""):
+            block_col = _find_revision_block(ws, r, revision)
+            if block_col is None:
+                history_block_warnings.append(
+                    f"{doc.get('document_number')}: no empty revision block remained for revision {revision}"
+                )
+            else:
+                ws.cell(row=r, column=block_col, value=revision)
+                ws.cell(row=r, column=block_col + 1, value=doc.get("actual_submission_date"))
+                ws.cell(row=r, column=block_col + 2, value=doc.get("returned_code"))
+                ws.cell(row=r, column=block_col + 3, value=doc.get("review_date"))
+
         for i, field in enumerate(EXTRA_EXPORT_COLUMNS):
             ws.cell(row=r, column=extra_start_col + i, value=doc.get(field))
 
@@ -829,6 +901,23 @@ def generate_updated_workbook(supabase, import_id):
             h.get("returned_code"), h.get("status"), h.get("remarks"), h.get("changed_by"),
             h.get("changed_at"),
         ])
+
+    if history_block_warnings:
+        warning_sheet = "Dashboard Export Warnings"
+        if warning_sheet in wb.sheetnames:
+            del wb[warning_sheet]
+        warning_ws = wb.create_sheet(warning_sheet)
+        warning_ws.append(["Warning"])
+        for warning in history_block_warnings:
+            warning_ws.append([warning])
+
+    # Ask Excel to recalculate retained formulas when the exported workbook opens.
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+        wb.calculation.calcMode = "auto"
+    except Exception:
+        pass
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1019,6 +1108,24 @@ def _revision_sort_key(value):
         return (0, float(text))
     except ValueError:
         return (1, text.casefold())
+
+
+def _next_sequential_revision(current_revision):
+    """Return the only valid next numeric revision, or None for non-numeric schemes."""
+    value = "" if current_revision is None else str(current_revision).strip()
+    if value.isdigit():
+        return str(int(value) + 1)
+    return None
+
+
+def _revision_transition_is_valid(current_revision, selected_revision):
+    """Allow correcting the current revision or advancing by exactly one numeric step."""
+    current = "" if current_revision is None else str(current_revision).strip()
+    selected = "" if selected_revision is None else str(selected_revision).strip()
+    if selected == current:
+        return True
+    expected = _next_sequential_revision(current)
+    return expected is not None and selected == expected
 
 
 def build_document_timeline(revision_history, audit_events):
@@ -1413,6 +1520,62 @@ tabs = st.tabs(
     ]
 )
 
+
+# Mouse-friendly horizontal controls for the tab bar. Streamlit does not expose
+# tab scrolling controls, so a tiny component augments the existing tablist.
+import streamlit.components.v1 as components
+components.html(
+    """
+    <script>
+    (function addTabScrollButtons() {
+      const doc = window.parent.document;
+      const install = () => {
+        const tabList = doc.querySelector('[data-testid="stTabs"] [role="tablist"]');
+        if (!tabList || doc.getElementById('dci-tab-scroll-right')) return false;
+
+        const host = tabList.parentElement;
+        host.style.display = 'flex';
+        host.style.alignItems = 'center';
+        host.style.gap = '6px';
+        tabList.style.flex = '1 1 auto';
+        tabList.style.minWidth = '0';
+        tabList.style.overflowX = 'auto';
+        tabList.style.scrollBehavior = 'smooth';
+        tabList.style.scrollbarWidth = 'thin';
+
+        const makeButton = (id, label, direction, title) => {
+          const button = doc.createElement('button');
+          button.id = id;
+          button.type = 'button';
+          button.textContent = label;
+          button.title = title;
+          button.style.cssText = [
+            'flex:0 0 auto', 'height:34px', 'min-width:42px', 'padding:0 10px',
+            'border:1px solid rgba(49,51,63,.25)', 'border-radius:8px',
+            'background:white', 'color:#31333f', 'font-weight:700',
+            'cursor:pointer', 'position:sticky', direction < 0 ? 'left:0' : 'right:0',
+            'z-index:20'
+          ].join(';');
+          button.onclick = () => tabList.scrollBy({left: direction * Math.max(320, tabList.clientWidth * 0.7), behavior:'smooth'});
+          return button;
+        };
+
+        host.insertBefore(makeButton('dci-tab-scroll-left', '<<', -1, 'Scroll tabs left'), tabList);
+        host.appendChild(makeButton('dci-tab-scroll-right', '>>', 1, 'Scroll tabs right'));
+        return true;
+      };
+
+      if (!install()) {
+        const observer = new MutationObserver(() => { if (install()) observer.disconnect(); });
+        observer.observe(doc.body, {childList:true, subtree:true});
+        setTimeout(() => observer.disconnect(), 10000);
+      }
+    })();
+    </script>
+    """,
+    height=0,
+)
+
 def build_document_selector_options(dataframe):
     """Return stable labels keyed by document_id, even when doc numbers repeat."""
     options = []
@@ -1781,7 +1944,14 @@ try:
                 )
 
                 current_revision = "" if pd.isna(doc_row["latest_rev"]) else str(doc_row["latest_rev"]).strip()
-                revision_choices = _clean_unique_options(REVISION_OPTIONS + [current_revision])
+                next_revision = _next_sequential_revision(current_revision)
+                if next_revision is not None:
+                    # For numeric revision schemes, users may correct the current
+                    # revision or advance by exactly one step—never skip revisions.
+                    revision_choices = _clean_unique_options([current_revision, next_revision])
+                else:
+                    # Non-numeric schemes remain controlled by the admin master list.
+                    revision_choices = _clean_unique_options(REVISION_OPTIONS + [current_revision])
                 current_code = normalize_code(doc_row["latest_code"])
                 code_choices = _clean_unique_options(RETURNED_CODE_OPTIONS + [current_code])
 
@@ -1817,6 +1987,13 @@ try:
                 validation_errors = []
                 if not new_revision:
                     validation_errors.append("A revision must be selected.")
+                elif not _revision_transition_is_valid(current_revision, new_revision):
+                    expected_revision = _next_sequential_revision(current_revision)
+                    if expected_revision is not None:
+                        validation_errors.append(
+                            f"Revision {current_revision} can only remain {current_revision} for a correction "
+                            f"or advance to revision {expected_revision}."
+                        )
                 if not new_code:
                     validation_errors.append("A return code must be selected.")
                 if derived_status == "UNMAPPED":
