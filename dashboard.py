@@ -62,11 +62,6 @@ NUMERIC_COLUMNS = [
     "stspl_manhours", "revision_cycle", "expected_manhours",
 ]
 
-DATE_EDIT_FIELDS = [
-    "planned_submission_date", "actual_submission_date", "review_date",
-    "approval_date", "expected_completion_date",
-]
-
 # Maps documents-table (Supabase) column names <-> dashboard RECORD_COLUMNS names.
 DOC_TO_RECORD_FIELD = {
     "document_number": "doc_no",
@@ -86,8 +81,6 @@ DOC_TO_RECORD_FIELD = {
     "action_owner": "action_owner",
     "expected_completion_date": "expected_completion_date",
 }
-RECORD_TO_DOC_FIELD = {v: k for k, v in DOC_TO_RECORD_FIELD.items()}
-
 STATUS_OPTIONS = [
     "FRESH SUBMISSION", "WITH EIL", "RETURNED BY EIL", "RESUBMISSION",
     "APPROVED", "APPROVED WITH COMMENTS", "ON HOLD", "CANCELLED",
@@ -123,9 +116,6 @@ def get_supabase():
         return None
     return create_client(url, key)
 
-
-def supabase_configured():
-    return get_supabase() is not None
 
 
 # ----------------------------------------------------------------------------
@@ -182,7 +172,7 @@ def parse_workbook_bytes(file_bytes):
             "approval_date": None,
             "original_row_number": r,
         }
-        rec["document_key"] = rec["doc_no"] or f"ROW-{r}"
+        rec["document_key"] = f"{rec['doc_no']}::ROW-{r}"
         records.append(rec)
 
         row_history = []
@@ -285,22 +275,29 @@ def upload_workbook_to_storage(supabase, import_id, file_bytes, filename):
 
 def run_import(supabase, file_bytes, filename, project_name, contractor,
                 review_period_days, version_mode, parent_import_id=None):
-    """Full import transaction: create import row -> upload workbook -> import
-    documents + raw data + initial history. Returns the new import_id.
-    Rolls back (deletes) the import row on failure so partial imports don't linger.
+    """Import a workbook without deactivating the current version prematurely.
+
+    Supabase/PostgREST calls are not a single database transaction from Python, so
+    this function uses a safe publish sequence: create pending import, upload and
+    populate it, mark it complete, and only then archive the replaced import.
     """
-    records, history, wb_project_name, wb_contractor = parse_workbook_bytes(file_bytes)
+    records, _history, wb_project_name, wb_contractor = parse_workbook_bytes(file_bytes)
     warnings, errors = validate_records(records)
     if errors:
         raise ValueError("; ".join(errors))
 
     file_hash = workbook_hash(file_bytes)
-
     version_number = 1
     if version_mode == "new_version" and parent_import_id:
-        parent = supabase.table("imports").select("version_number").eq("id", parent_import_id).execute()
+        parent = (
+            supabase.table("imports")
+            .select("version_number")
+            .eq("id", parent_import_id)
+            .limit(1)
+            .execute()
+        )
         if parent.data:
-            version_number = (parent.data[0]["version_number"] or 1) + 1
+            version_number = int(parent.data[0].get("version_number") or 1) + 1
 
     import_row = {
         "original_filename": filename,
@@ -314,30 +311,41 @@ def run_import(supabase, file_bytes, filename, project_name, contractor,
         "workbook_hash": file_hash,
         "storage_bucket": STORAGE_BUCKET,
         "original_storage_path": "pending",
-        "review_period_days": review_period_days,
+        "review_period_days": int(review_period_days),
         "validation_status": "warnings" if warnings else "clean",
         "import_status": "pending",
         "warning_count": len(warnings),
-        "error_count": len(errors),
+        "error_count": 0,
         "is_active": True,
     }
     created = supabase.table("imports").insert(import_row).execute()
+    if not created.data:
+        raise RuntimeError("Supabase did not return the newly created import row.")
     import_id = created.data[0]["id"]
 
+    storage_path = None
     try:
-        if version_mode == "replace" and parent_import_id:
-            supabase.table("imports").update({"is_active": False, "import_status": "archived"}) \
-                .eq("id", parent_import_id).execute()
-
         storage_path = upload_workbook_to_storage(supabase, import_id, file_bytes, filename)
         supabase.table("imports").update({"original_storage_path": storage_path}).eq("id", import_id).execute()
-
         _bulk_import_documents(supabase, import_id, records)
-
         supabase.table("imports").update({"import_status": "complete"}).eq("id", import_id).execute()
+
+        if version_mode == "replace" and parent_import_id:
+            supabase.table("imports").update({
+                "is_active": False,
+                "import_status": "archived",
+            }).eq("id", parent_import_id).execute()
+
+        st.cache_data.clear()
         return import_id, warnings
     except Exception:
-        supabase.table("imports").update({"import_status": "failed"}).eq("id", import_id).execute()
+        # Keep the previous active import untouched. Mark this import failed so it
+        # cannot be selected as a valid workbook. Cascading cleanup can be done by
+        # an admin without destroying evidence needed to diagnose the failure.
+        supabase.table("imports").update({
+            "is_active": False,
+            "import_status": "failed",
+        }).eq("id", import_id).execute()
         raise
 
 
@@ -372,10 +380,18 @@ def _bulk_import_documents(supabase, import_id, records, batch_size=200):
             })
 
         inserted = supabase.table("documents").insert(doc_rows).execute()
-        inserted_rows = inserted.data
+        inserted_rows = inserted.data or []
+        if len(inserted_rows) != len(doc_rows):
+            raise RuntimeError(
+                f"Inserted {len(inserted_rows)} of {len(doc_rows)} documents in a batch."
+            )
+        inserted_by_key = {row["document_key"]: row for row in inserted_rows}
 
         raw_rows, history_rows = [], []
-        for rec, doc in zip(batch, inserted_rows):
+        for rec in batch:
+            doc = inserted_by_key.get(rec["document_key"])
+            if doc is None:
+                raise RuntimeError(f"Could not resolve inserted document: {rec['document_key']}")
             record_json = {k: _jsonable(v) for k, v in rec.items() if not k.startswith("_")}
             raw_rows.append({
                 "document_id": doc["id"],
@@ -490,30 +506,80 @@ def get_document_history(supabase, document_id):
     return res.data or []
 
 
-def save_document_changes(supabase, document_id, form_values, current_record, changed_by, event_type):
-    """Diff form_values against current_record, and if anything actually
-    changed, call the atomic Postgres RPC to persist it + append history.
-    Returns (changed: bool, diff: list[dict]).
+def get_history_for_documents(supabase, document_ids, batch_size=200):
+    """Fetch history for many documents in a handful of batched requests
+    (one .in_() query per batch_size ids) instead of one request per document.
+    Use this instead of looping get_document_history() over a whole workbook —
+    with hundreds of documents that loop is slow and prone to timing out.
     """
-    changes, old_values, diff = {}, {}, []
-    for doc_field, record_field in DOC_TO_RECORD_FIELD.items():
-        if record_field not in form_values:
+    document_ids = [d for d in document_ids if d is not None and not (isinstance(d, float) and pd.isna(d))]
+    rows = []
+    for i in range(0, len(document_ids), batch_size):
+        chunk = document_ids[i:i + batch_size]
+        res = (
+            supabase.table("document_history")
+            .select("*")
+            .in_("document_id", chunk)
+            .order("changed_at", desc=False)
+            .execute()
+        )
+        rows.extend(res.data or [])
+    return rows
+
+
+DATE_RECORD_FIELDS = {
+    "schedule_submission_date", "latest_uploaded_date", "latest_from_eil_date",
+    "approval_date", "expected_completion_date",
+}
+
+
+def _normalise_record_value(field, value):
+    """Normalize form/database scalars so previews and saves compare identically."""
+    if field in DATE_RECORD_FIELDS:
+        return _date_to_iso(value)
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def build_change_diff(form_values, current_record):
+    diff = []
+    for record_field, new_value in form_values.items():
+        old_value = current_record.get(record_field)
+        new_norm = _normalise_record_value(record_field, new_value)
+        old_norm = _normalise_record_value(record_field, old_value)
+        if new_norm != old_norm:
+            diff.append({
+                "field": record_field,
+                "old": old_norm,
+                "new": new_norm,
+            })
+    return diff
+
+
+def save_document_changes(supabase, document_id, form_values, current_record, changed_by, event_type):
+    """Persist changed fields atomically through the database RPC."""
+    record_diff = build_change_diff(form_values, current_record)
+    if not record_diff:
+        return False, []
+
+    changes = {}
+    old_values = {}
+    for item in record_diff:
+        doc_field = next(
+            (db_field for db_field, record_field in DOC_TO_RECORD_FIELD.items()
+             if record_field == item["field"]),
+            None,
+        )
+        if doc_field is None:
             continue
-        new_val = form_values[record_field]
-        old_val = current_record.get(record_field)
-
-        if doc_field in ("planned_submission_date", "actual_submission_date", "review_date",
-                          "approval_date", "expected_completion_date"):
-            new_val_norm = new_val.isoformat() if isinstance(new_val, (date, datetime)) and new_val else None
-            old_val_norm = _date_to_iso(old_val)
-        else:
-            new_val_norm = "" if new_val is None else str(new_val).strip()
-            old_val_norm = "" if pd.isna(old_val) or old_val is None else str(old_val).strip()
-
-        if new_val_norm != old_val_norm:
-            changes[doc_field] = new_val_norm
-            old_values[doc_field] = old_val_norm
-            diff.append({"field": record_field, "old": old_val_norm or "(blank)", "new": new_val_norm or "(blank)"})
+        changes[doc_field] = item["new"] or None
+        old_values[doc_field] = item["old"] or None
 
     if not changes:
         return False, []
@@ -527,7 +593,15 @@ def save_document_changes(supabase, document_id, form_values, current_record, ch
     }).execute()
 
     st.cache_data.clear()
-    return True, diff
+    display_diff = [
+        {
+            "field": item["field"],
+            "old": item["old"] or "(blank)",
+            "new": item["new"] or "(blank)",
+        }
+        for item in record_diff
+    ]
+    return True, display_diff
 
 
 def _date_to_iso(val):
@@ -540,7 +614,11 @@ def _date_to_iso(val):
     if isinstance(val, (date, datetime)):
         return val.isoformat()[:10]
     if isinstance(val, str):
-        return val[:10] if val else None
+        text = val.strip()
+        if not text:
+            return None
+        parsed = pd.to_datetime(text, errors="coerce")
+        return None if pd.isna(parsed) else parsed.date().isoformat()
     return None
 
 
@@ -1055,6 +1133,19 @@ tabs = st.tabs(
     ]
 )
 
+def build_document_selector_options(dataframe):
+    """Return stable labels keyed by document_id, even when doc numbers repeat."""
+    options = []
+    duplicate_counts = dataframe["doc_no"].value_counts(dropna=False)
+    for _, row in dataframe.sort_values(["doc_no", "original_row_number"], na_position="last").iterrows():
+        doc_no = str(row.get("doc_no") or "(no document number)")
+        label = doc_no
+        if duplicate_counts.get(row.get("doc_no"), 0) > 1:
+            label = f"{doc_no} — Excel row {row.get('original_row_number')}"
+        options.append((label, row.get("document_id")))
+    return options
+
+
 try:
     # ------------------------------------------------------------------
     # TAB 1: EXECUTIVE SUMMARY
@@ -1367,17 +1458,24 @@ try:
             st.info("No workbook imported yet.")
         else:
             st.subheader("Update Document")
-            all_doc_nos = sorted(df["doc_no"].dropna().unique().tolist())
+            selector_options = build_document_selector_options(df)
+            option_labels = [label for label, _ in selector_options]
+            id_by_label = dict(selector_options)
             default_idx = 0
             preselected = st.session_state.get("selected_doc_no")
-            if preselected in all_doc_nos:
-                default_idx = all_doc_nos.index(preselected)
+            if preselected:
+                matching = [i for i, label in enumerate(option_labels) if label == preselected or label.startswith(f"{preselected} —")]
+                if matching:
+                    default_idx = matching[0]
 
-            selected_doc_no = st.selectbox("Document", all_doc_nos, index=default_idx if all_doc_nos else 0, key="update_doc_select")
+            selected_label = st.selectbox(
+                "Document", option_labels, index=default_idx, key="update_doc_select"
+            )
+            document_id = id_by_label.get(selected_label)
 
-            if selected_doc_no:
-                doc_row = df[df["doc_no"] == selected_doc_no].iloc[0]
-                document_id = doc_row["document_id"]
+            if document_id is not None:
+                doc_row = df[df["document_id"] == document_id].iloc[0]
+                selected_doc_no = doc_row["doc_no"]
 
                 st.markdown("#### Current Information (read-only)")
                 ro1, ro2, ro3 = st.columns(3)
@@ -1430,18 +1528,14 @@ try:
                 pending = st.session_state.get("pending_doc_changes")
                 if pending and pending[0] == document_id:
                     _, form_values, current_record = pending
-                    changes_preview = []
-                    for record_field, new_val in form_values.items():
-                        old_val = current_record.get(record_field)
-                        if record_field in ("schedule_submission_date", "latest_uploaded_date", "latest_from_eil_date",
-                                            "approval_date", "expected_completion_date"):
-                            new_norm = new_val.isoformat() if new_val else None
-                            old_norm = _date_to_iso(old_val)
-                        else:
-                            new_norm = "" if new_val is None else str(new_val).strip()
-                            old_norm = "" if pd.isna(old_val) or old_val is None else str(old_val).strip()
-                        if new_norm != old_norm:
-                            changes_preview.append({"Field": record_field, "Current Value": old_norm or "(blank)", "New Value": new_norm or "(blank)"})
+                    changes_preview = [
+                        {
+                            "Field": item["field"],
+                            "Current Value": item["old"] or "(blank)",
+                            "New Value": item["new"] or "(blank)",
+                        }
+                        for item in build_change_diff(form_values, current_record)
+                    ]
 
                     if not changes_preview:
                         st.info("No changes detected.")
@@ -1483,16 +1577,23 @@ try:
             st.info("No workbook imported yet.")
         else:
             st.subheader("Document Timeline")
-            all_doc_nos = sorted(df["doc_no"].dropna().unique().tolist())
+            selector_options = build_document_selector_options(df)
+            option_labels = [label for label, _ in selector_options]
+            id_by_label = dict(selector_options)
             default_idx = 0
             preselected = st.session_state.get("selected_doc_no")
-            if preselected in all_doc_nos:
-                default_idx = all_doc_nos.index(preselected)
-            timeline_doc_no = st.selectbox("Document", all_doc_nos, index=default_idx if all_doc_nos else 0, key="timeline_doc_select")
+            if preselected:
+                matching = [i for i, label in enumerate(option_labels) if label == preselected or label.startswith(f"{preselected} —")]
+                if matching:
+                    default_idx = matching[0]
+            timeline_label = st.selectbox(
+                "Document", option_labels, index=default_idx, key="timeline_doc_select"
+            )
+            document_id = id_by_label.get(timeline_label)
 
-            if timeline_doc_no:
-                doc_row = df[df["doc_no"] == timeline_doc_no].iloc[0]
-                document_id = doc_row["document_id"]
+            if document_id is not None:
+                doc_row = df[df["document_id"] == document_id].iloc[0]
+                timeline_doc_no = doc_row["doc_no"]
                 st.caption(f"{doc_row['title'] or ''}  |  Discipline: {doc_row['discipline'] or 'N/A'}  |  Vendor: {doc_row['poc'] or 'N/A'}")
 
                 events = get_document_history(supabase, document_id)
@@ -1568,7 +1669,14 @@ try:
 
                 preview_df = pd.DataFrame(records[:10])
                 cols_to_show = [c for c in ["doc_no", "title", "discipline", "status", "latest_rev", "latest_code"] if c in preview_df.columns]
-                st.dataframe(preview_df[cols_to_show] if cols_to_show else preview_df, use_container_width=True, hide_index=True)
+                preview_display = preview_df[cols_to_show] if cols_to_show else preview_df
+                # Raw Excel cells often mix plain numbers (1, 2, 3) with text ("R", "V",
+                # "1 WITH COMMENTS") in the same column (e.g. latest_code, latest_rev).
+                # Arrow can't serialize a mixed int/str object column, so stringify
+                # everything for display purposes only -- the underlying import still
+                # uses the original typed values.
+                preview_display = preview_display.astype(object).where(preview_display.notna(), "").astype(str)
+                st.dataframe(preview_display, use_container_width=True, hide_index=True)
 
                 if dup:
                     st.info(
@@ -1633,9 +1741,7 @@ try:
                             st.error(f"Export failed: {ex}")
             with ec2:
                 if has_data:
-                    all_history_rows = []
-                    for did in df["document_id"].dropna().unique().tolist():
-                        all_history_rows.extend(get_document_history(supabase, did))
+                    all_history_rows = get_history_for_documents(supabase, df["document_id"].dropna().unique().tolist())
                     if all_history_rows:
                         hist_csv = pd.DataFrame(all_history_rows).to_csv(index=False).encode("utf-8")
                         st.download_button(
