@@ -10,8 +10,10 @@ Required Streamlit secrets (see secrets.toml.example):
 """
 
 import hashlib
+import hmac
 import os
 import io
+import zipfile
 from datetime import datetime, date
 
 import numpy as np
@@ -38,6 +40,9 @@ AGING_BUCKET_ORDER = ["Not due yet", "0-7 days", "8-14 days", "15-21 days", ">21
 CHART_PALETTE = ["#B4A7D6", "#F1948A", "#8EE4D0", "#f5c26b", "#8ab4f8", "#c9a0dc"]
 
 STORAGE_BUCKET = "dci-workbooks"
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_CONSECUTIVE_EMPTY_ROWS = 25
+TEMPLATE_ENGINE_VERSION = 2
 
 # Original Excel-derived fields (unchanged shape expected by all the existing
 # analytical tabs) plus the new dashboard-managed / editable fields, so a
@@ -484,7 +489,7 @@ def discover_dci_layout(ws):
 
     data_start_row = _discover_data_start_row(ws, header_row, columns["doc_no"])
     return {
-        "engine_version": 1,
+        "engine_version": TEMPLATE_ENGINE_VERSION,
         "sheet_name": ws.title,
         "header_row": header_row,
         "data_start_row": data_start_row,
@@ -594,7 +599,13 @@ def parse_workbook_bytes(file_bytes):
     """
     import openpyxl
 
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    _validate_xlsx_container(file_bytes)
+    wb = openpyxl.load_workbook(
+        io.BytesIO(file_bytes),
+        data_only=True,
+        read_only=False,
+        keep_links=True,
+    )
     ws, layout = discover_dci_sheet_and_layout(wb)
     columns = layout["columns"]
 
@@ -602,9 +613,17 @@ def parse_workbook_bytes(file_bytes):
     contractor = _find_label_value(ws, "CONTRACTOR")
     records, history = [], []
 
+    consecutive_empty_rows = 0
     for r in range(layout["data_start_row"], ws.max_row + 1):
         doc_no = _cell_value(ws, r, columns, "doc_no")
         if doc_no is None or str(doc_no).strip() == "":
+            consecutive_empty_rows += 1
+            if records and consecutive_empty_rows >= MAX_CONSECUTIVE_EMPTY_ROWS:
+                break
+            continue
+        consecutive_empty_rows = 0
+        if _normalise_header(doc_no) in HEADER_ALIASES["doc_no"]:
+            # Ignore repeated headers sometimes inserted between print sections.
             continue
 
         vendor = _cell_value(ws, r, columns, "vendor")
@@ -714,6 +733,106 @@ def _date_jsonable(value):
         return None
 
 
+
+def _validate_xlsx_container(file_bytes):
+    """Reject oversized, renamed, encrypted, or malformed uploads before parsing."""
+    if not isinstance(file_bytes, (bytes, bytearray)) or not file_bytes:
+        raise ValueError("The uploaded workbook is empty.")
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"The workbook is larger than the allowed {MAX_UPLOAD_BYTES // (1024 * 1024)} MB."
+        )
+    if not zipfile.is_zipfile(io.BytesIO(file_bytes)):
+        raise ValueError("This is not a valid .xlsx workbook.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+            names = set(archive.namelist())
+            required = {"[Content_Types].xml", "xl/workbook.xml"}
+            if not required.issubset(names):
+                raise ValueError("The uploaded file is not a valid Excel .xlsx package.")
+            encrypted_markers = {"EncryptedPackage", "EncryptionInfo"}
+            if names & encrypted_markers:
+                raise ValueError("Password-protected Excel workbooks are not supported.")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("The uploaded workbook is damaged or incomplete.") from exc
+
+
+def workbook_hash(file_bytes):
+    """Stable content fingerprint used for exact-duplicate detection."""
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def validate_records(records):
+    """Validate parsed document rows without guessing or silently discarding problems."""
+    warnings, errors = [], []
+    if not records:
+        errors.append(
+            "The workbook structure was recognised, but no document rows containing "
+            "a Document Number were found."
+        )
+        return warnings, errors
+
+    seen = {}
+    duplicate_numbers = set()
+    for record in records:
+        doc_no = str(record.get("doc_no") or "").strip()
+        if not doc_no:
+            errors.append(
+                f"Excel row {record.get('original_row_number', '?')} has no Document Number."
+            )
+            continue
+        if doc_no in seen:
+            duplicate_numbers.add(doc_no)
+        else:
+            seen[doc_no] = record.get("original_row_number")
+
+    if duplicate_numbers:
+        sample = ", ".join(sorted(duplicate_numbers)[:10])
+        warnings.append(
+            f"{len(duplicate_numbers)} duplicate Document Number value(s) were found: {sample}"
+            + (" …" if len(duplicate_numbers) > 10 else "")
+            + ". They will remain separate records using their original Excel row numbers."
+        )
+
+    missing_titles = [
+        record.get("original_row_number")
+        for record in records
+        if not str(record.get("title") or "").strip()
+    ]
+    if missing_titles:
+        warnings.append(f"{len(missing_titles)} document row(s) have no Document Title.")
+
+    invalid_history_dates = 0
+    for record in records:
+        for event in record.get("_history_rows", []):
+            uploaded = pd.to_datetime(event.get("uploaded_date"), errors="coerce")
+            returned = pd.to_datetime(event.get("from_eil_date"), errors="coerce")
+            if pd.notna(uploaded) and pd.notna(returned) and returned < uploaded:
+                invalid_history_dates += 1
+    if invalid_history_dates:
+        warnings.append(
+            f"{invalid_history_dates} revision block(s) have a Return Date earlier than "
+            "their Revision Date. They will be retained but excluded from turnaround metrics."
+        )
+
+    return warnings, errors
+
+
+def inspect_workbook_bytes(file_bytes):
+    """Validate and discover a workbook once, returning reusable diagnostics."""
+    import openpyxl
+
+    _validate_xlsx_container(file_bytes)
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(file_bytes),
+        data_only=False,
+        read_only=False,
+        keep_links=True,
+    )
+    worksheet, layout = discover_dci_sheet_and_layout(workbook)
+    return worksheet, layout, layout_summary(layout)
+
+
 # ----------------------------------------------------------------------------
 # IMPORT WORKFLOW (Supabase writes)
 # ----------------------------------------------------------------------------
@@ -762,6 +881,7 @@ def run_import(supabase, file_bytes, filename, project_name, contractor,
     this function uses a safe publish sequence: create pending import, upload and
     populate it, mark it complete, and only then archive the replaced import.
     """
+    _worksheet, discovered_layout, _diagnostics = inspect_workbook_bytes(file_bytes)
     records, _history, wb_project_name, wb_contractor = parse_workbook_bytes(file_bytes)
     warnings, errors = validate_records(records)
     if errors:
@@ -787,7 +907,7 @@ def run_import(supabase, file_bytes, filename, project_name, contractor,
         "contractor": contractor or wb_contractor,
         "version_number": version_number,
         "parent_import_id": parent_import_id if version_mode == "new_version" else None,
-        "source_sheet_name": "DCI",
+        "source_sheet_name": discovered_layout["sheet_name"],
         "row_count": len(records),
         "workbook_hash": file_hash,
         "storage_bucket": STORAGE_BUCKET,
@@ -1128,16 +1248,37 @@ def _is_formula_cell(cell):
     return isinstance(cell.value, str) and cell.value.startswith("=")
 
 
-def _write_preserving_formula(ws, row, column, value):
-    """Write a value only when the target is not an existing formula cell.
+def _excel_scalar(value):
+    """Convert database ISO dates back to genuine Excel date values where possible."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value.to_pydatetime()
+    if isinstance(value, (date, datetime)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        parsed = pd.to_datetime(text, errors="coerce")
+        if pd.notna(parsed) and len(text) >= 8:
+            return parsed.to_pydatetime()
+        return text
+    return value
 
-    This keeps the workbook's calculation logic intact. Formula-driven summary
-    cells will recalculate from the revision-history blocks when Excel opens.
-    """
+
+def _write_preserving_formula(ws, row, column, value):
+    """Write only into input cells, never over an existing Excel formula."""
+    if not column:
+        return False
     cell = ws.cell(row=row, column=column)
     if _is_formula_cell(cell):
         return False
-    cell.value = value
+    old_number_format = cell.number_format
+    converted = _excel_scalar(value)
+    cell.value = converted
+    if isinstance(converted, (date, datetime)) and old_number_format == "General":
+        cell.number_format = "dd-mmm-yyyy"
     return True
 
 
@@ -1186,10 +1327,23 @@ def generate_updated_workbook(supabase, import_id):
         supabase.table("documents").select("*").eq("import_id", import_id).eq("is_active", True)
     )
 
-    extra_start_col = ws.max_column + 1
     header_row = layout["header_row"]
-    for i, field in enumerate(EXTRA_EXPORT_COLUMNS):
-        ws.cell(row=header_row, column=extra_start_col + i, value=EXTRA_EXPORT_HEADERS[field])
+    existing_extra_columns = {}
+    for col in range(1, ws.max_column + 1):
+        header = _normalise_header(ws.cell(header_row, col).value)
+        for field, label in EXTRA_EXPORT_HEADERS.items():
+            if header == _normalise_header(label):
+                existing_extra_columns[field] = col
+
+    next_extra_col = ws.max_column + 1
+    extra_columns = {}
+    for field in EXTRA_EXPORT_COLUMNS:
+        if field in existing_extra_columns:
+            extra_columns[field] = existing_extra_columns[field]
+        else:
+            extra_columns[field] = next_extra_col
+            ws.cell(row=header_row, column=next_extra_col, value=EXTRA_EXPORT_HEADERS[field])
+            next_extra_col += 1
 
     history_block_warnings = []
     for doc in doc_rows:
@@ -1227,7 +1381,7 @@ def generate_updated_workbook(supabase, import_id):
                 _write_preserving_formula(ws, r, block["from_eil_date"], doc.get("review_date"))
 
         for i, field in enumerate(EXTRA_EXPORT_COLUMNS):
-            ws.cell(row=r, column=extra_start_col + i, value=doc.get(field))
+            ws.cell(row=r, column=extra_columns[field], value=doc.get(field))
 
     # History sheet
     history_sheet_name = "Dashboard Change History"
@@ -2413,7 +2567,7 @@ try:
                         entered_password = st.text_input("Admin password", type="password",
                                                          key="master_data_configuration_password")
                         if st.button("Unlock Configuration", key="unlock_master_data_configuration"):
-                            if entered_password == admin_password:
+                            if hmac.compare_digest(entered_password, admin_password):
                                 st.session_state[unlock_key] = True
                                 st.rerun()
                             else:
@@ -2598,6 +2752,7 @@ try:
             st.caption("No pending upload. Use the uploader above or the sidebar.")
         else:
             try:
+                _preview_ws, discovered_layout, discovery_info = inspect_workbook_bytes(pending_bytes)
                 records, history, wb_project, wb_contractor = parse_workbook_bytes(pending_bytes)
                 warnings, errors = validate_records(records)
                 file_hash = workbook_hash(pending_bytes)
@@ -2608,6 +2763,28 @@ try:
                 p1.metric("Filename", pending_name)
                 p2.metric("Rows Found", len(records))
                 p3.metric("Warnings", len(warnings))
+
+                with st.expander("Detected workbook structure", expanded=False):
+                    d1, d2, d3 = st.columns(3)
+                    d1.metric("Worksheet", discovery_info["sheet"])
+                    d2.metric("Header row", discovery_info["header_row"])
+                    d3.metric("Revision blocks", len(discovery_info["revision_blocks"]))
+                    st.caption(
+                        f"First data row: {discovery_info['data_start_row']} · "
+                        f"Template engine: v{discovered_layout.get('engine_version', TEMPLATE_ENGINE_VERSION)}"
+                    )
+                    field_rows = [
+                        {"Logical field": field.replace("_", " ").title(), "Detected column": column}
+                        for field, column in discovery_info["fields"].items()
+                    ]
+                    if field_rows:
+                        st.dataframe(pd.DataFrame(field_rows), use_container_width=True, hide_index=True)
+                    if discovery_info["revision_blocks"]:
+                        st.dataframe(
+                            pd.DataFrame(discovery_info["revision_blocks"]),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
                 if errors:
                     for e in errors:
