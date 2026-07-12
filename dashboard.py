@@ -302,6 +302,101 @@ def derive_history(hist):
 
 
 # ----------------------------------------------------------------------------
+# SHARED CHART HELPER
+# ----------------------------------------------------------------------------
+def render_monthly_grouped_chart(data, date_col, title, count_label="Count"):
+    """Render a year-grouped monthly bar chart (matching the legacy Excel dashboard
+    style: grouped bars per year across Jan-Dec, plus a colour-coded data table
+    underneath) for any dataframe with a date column. Used for both the Monthly
+    Submission Chart and the Monthly Review Chart so the two stay visually
+    consistent and any style tweak only needs to happen in one place.
+    """
+    d = data.dropna(subset=[date_col]).copy()
+    if d.empty:
+        st.info(f"No data available for '{title}' with the current filters.")
+        return
+
+    d["year"] = d[date_col].dt.year
+    d["month_num"] = d[date_col].dt.month
+
+    years = sorted(d["year"].unique(), reverse=True)
+    grid_index = pd.MultiIndex.from_product([years, range(1, 13)], names=["year", "month_num"])
+    grid = (
+        d.groupby(["year", "month_num"]).size()
+        .reindex(grid_index, fill_value=0)
+        .reset_index(name=count_label)
+    )
+    grid["month_name"] = grid["month_num"].apply(lambda m: MONTH_ORDER[m - 1])
+    grid["year"] = grid["year"].astype(str)
+
+    year_labels = [str(y) for y in years]
+    color_map = {y: CHART_PALETTE[i % len(CHART_PALETTE)] for i, y in enumerate(year_labels)}
+
+    with st.container(border=True):
+        fig = px.bar(
+            grid,
+            x="month_name",
+            y=count_label,
+            color="year",
+            barmode="group",
+            category_orders={"month_name": MONTH_ORDER, "year": year_labels},
+            color_discrete_map=color_map,
+        )
+        fig.update_traces(marker_line_color="rgba(255,255,255,0.6)", marker_line_width=1)
+        fig.update_layout(
+            title=dict(
+                text=title,
+                x=0.5,
+                xanchor="center",
+                font=dict(family="Arial Black, Arial, sans-serif", size=22, color="#595959"),
+            ),
+            yaxis_title="No. of Deliverables",
+            xaxis_title="",
+            yaxis=dict(gridcolor="#e6e6e6", zeroline=False),
+            xaxis=dict(showgrid=False),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            bargap=0.28,
+            bargroupgap=0.04,
+            legend=dict(
+                orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5,
+                title_text="", font=dict(size=13),
+            ),
+            margin=dict(t=70, b=10, l=10, r=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Data table styled to echo the reference image: a small colour swatch
+        # next to each year label, bordered cells, months across the top.
+        header_cells = "".join(
+            f"<th style='padding:5px 10px;border:1px solid #d9d9d9;text-align:center;'>{m}</th>"
+            for m in MONTH_ORDER
+        )
+        row_html = []
+        for y in year_labels:
+            color = color_map[y]
+            series = grid.loc[grid["year"] == y].set_index("month_name").reindex(MONTH_ORDER)[count_label]
+            value_cells = "".join(
+                f"<td style='padding:5px 10px;border:1px solid #d9d9d9;text-align:center;'>{int(v)}</td>"
+                for v in series
+            )
+            row_html.append(
+                "<tr>"
+                f"<td style='padding:5px 10px;border:1px solid #d9d9d9;white-space:nowrap;'>"
+                f"<span style='display:inline-block;width:10px;height:10px;background:{color};"
+                f"border:1px solid #999;margin-right:6px;'></span>{y}</td>"
+                f"{value_cells}</tr>"
+            )
+        table_html = f"""
+        <table style='border-collapse:collapse;width:100%;font-size:14px;color:#333;margin-top:4px;'>
+            <tr><th style='padding:5px 10px;border:1px solid #d9d9d9;'></th>{header_cells}</tr>
+            {''.join(row_html)}
+        </table>
+        """
+        st.markdown(table_html, unsafe_allow_html=True)
+
+
+# ----------------------------------------------------------------------------
 # SIDEBAR - FILE UPLOAD
 # ----------------------------------------------------------------------------
 st.sidebar.title("DCI Dashboard")
@@ -491,90 +586,10 @@ try:
     # TAB 2: SUBMISSION PROGRESS
     # ----------------------------------------------------------------------------
     with tabs[1]:
-        sub_hist = filtered_hist.dropna(subset=["uploaded_date"]).copy()
-    
-        if sub_hist.empty:
-            st.subheader("Monthly Submission Chart")
-            st.info("No submission history available for the current filters.")
-        else:
-            sub_hist["year"] = sub_hist["uploaded_date"].dt.year
-            sub_hist["month_num"] = sub_hist["uploaded_date"].dt.month
-    
-            years = sorted(sub_hist["year"].unique(), reverse=True)
-            grid_index = pd.MultiIndex.from_product([years, range(1, 13)], names=["year", "month_num"])
-            grid = (
-                sub_hist.groupby(["year", "month_num"]).size()
-                .reindex(grid_index, fill_value=0)
-                .reset_index(name="Submissions")
-            )
-            grid["month_name"] = grid["month_num"].apply(lambda m: MONTH_ORDER[m - 1])
-            grid["year"] = grid["year"].astype(str)
-    
-            year_labels = [str(y) for y in years]
-            color_map = {y: CHART_PALETTE[i % len(CHART_PALETTE)] for i, y in enumerate(year_labels)}
-    
-            with st.container(border=True):
-                fig = px.bar(
-                    grid,
-                    x="month_name",
-                    y="Submissions",
-                    color="year",
-                    barmode="group",
-                    category_orders={"month_name": MONTH_ORDER, "year": year_labels},
-                    color_discrete_map=color_map,
-                )
-                fig.update_traces(marker_line_color="rgba(255,255,255,0.6)", marker_line_width=1)
-                fig.update_layout(
-                    title=dict(
-                        text="Monthly Submission Chart",
-                        x=0.5,
-                        xanchor="center",
-                        font=dict(family="Arial Black, Arial, sans-serif", size=22, color="#595959"),
-                    ),
-                    yaxis_title="No. of Deliverables",
-                    xaxis_title="",
-                    yaxis=dict(gridcolor="#e6e6e6", zeroline=False),
-                    xaxis=dict(showgrid=False),
-                    plot_bgcolor="white",
-                    paper_bgcolor="white",
-                    bargap=0.28,
-                    bargroupgap=0.04,
-                    legend=dict(
-                        orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5,
-                        title_text="", font=dict(size=13),
-                    ),
-                    margin=dict(t=70, b=10, l=10, r=10),
-                )
-                st.plotly_chart(fig, use_container_width=True)
-    
-                # Data table styled to echo the reference image: a small colour swatch
-                # next to each year label, bordered cells, months across the top.
-                header_cells = "".join(
-                    f"<th style='padding:5px 10px;border:1px solid #d9d9d9;text-align:center;'>{m}</th>"
-                    for m in MONTH_ORDER
-                )
-                row_html = []
-                for y in year_labels:
-                    color = color_map[y]
-                    series = grid.loc[grid["year"] == y].set_index("month_name").reindex(MONTH_ORDER)["Submissions"]
-                    value_cells = "".join(
-                        f"<td style='padding:5px 10px;border:1px solid #d9d9d9;text-align:center;'>{int(v)}</td>"
-                        for v in series
-                    )
-                    row_html.append(
-                        "<tr>"
-                        f"<td style='padding:5px 10px;border:1px solid #d9d9d9;white-space:nowrap;'>"
-                        f"<span style='display:inline-block;width:10px;height:10px;background:{color};"
-                        f"border:1px solid #999;margin-right:6px;'></span>{y}</td>"
-                        f"{value_cells}</tr>"
-                    )
-                table_html = f"""
-                <table style='border-collapse:collapse;width:100%;font-size:14px;color:#333;margin-top:4px;'>
-                    <tr><th style='padding:5px 10px;border:1px solid #d9d9d9;'></th>{header_cells}</tr>
-                    {''.join(row_html)}
-                </table>
-                """
-                st.markdown(table_html, unsafe_allow_html=True)
+        st.subheader("Monthly Submission Chart")
+        render_monthly_grouped_chart(
+            filtered_hist, "uploaded_date", "Monthly Submission Chart", "Submissions"
+        )
     
         st.markdown("---")
         st.subheader("Planned vs Actual First Submission")
@@ -618,12 +633,12 @@ try:
     # TAB 3: REVIEW PROGRESS
     # ----------------------------------------------------------------------------
     with tabs[2]:
-        st.subheader("Monthly Reviews Completed (EIL return)")
-        rev_hist = filtered_hist.dropna(subset=["from_eil_date"])
-        monthly_rev = rev_hist.groupby("returned_month").size().reset_index(name="Reviews").sort_values("returned_month")
-        fig = px.bar(monthly_rev, x="returned_month", y="Reviews", title="Documents reviewed per month (all revisions)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.subheader("Monthly Review Chart")
+        render_monthly_grouped_chart(
+            filtered_hist, "from_eil_date", "Monthly Review Chart", "Reviews"
+        )
     
+        st.markdown("---")
         st.subheader("Submission-to-Review Turnaround")
         invalid_count = st.session_state.get("_invalid_turnaround_count", 0)
         if invalid_count:
