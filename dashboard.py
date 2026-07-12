@@ -10,6 +10,7 @@ Required Streamlit secrets (see secrets.toml.example):
 """
 
 import hashlib
+import os
 import io
 from datetime import datetime, date
 
@@ -81,11 +82,112 @@ DOC_TO_RECORD_FIELD = {
     "action_owner": "action_owner",
     "expected_completion_date": "expected_completion_date",
 }
-STATUS_OPTIONS = [
-    "FRESH SUBMISSION", "WITH EIL", "RETURNED BY EIL", "RESUBMISSION",
-    "APPROVED", "APPROVED WITH COMMENTS", "ON HOLD", "CANCELLED",
-]
-RETURNED_CODE_OPTIONS = ["", "1", "1 WITH COMMENTS", "2", "3", "R", "V"]
+DEFAULT_REVISION_OPTIONS = [str(i) for i in range(0, 21)]
+DEFAULT_CODE_TO_DCI_STATUS = {
+    "1": "APPROVED",
+    "1 WITH COMMENTS": "APPROVED WITH COMMENTS",
+    "2": "COMMENTED",
+    "3": "RESUBMISSION",
+    "R": "RETAINED FOR RECORDS",
+    "V": "VOID",
+}
+FORM_CONFIG_KEY = "revision_update_form"
+
+
+def get_admin_password():
+    """Read configuration-admin password from Streamlit secrets or environment."""
+    try:
+        secret_value = st.secrets.get("ADMIN_PASSWORD")
+    except Exception:
+        secret_value = None
+    return str(secret_value or os.getenv("ADMIN_PASSWORD", "")).strip()
+
+
+def admin_password_configured():
+    return bool(get_admin_password())
+
+
+def _clean_unique_options(values):
+    cleaned, seen = [], set()
+    for value in values or []:
+        item = str(value).strip()
+        if item and item not in seen:
+            cleaned.append(item)
+            seen.add(item)
+    return cleaned
+
+
+def _values_from_documents(df, column):
+    if df is None or df.empty or column not in df.columns:
+        return []
+    return _clean_unique_options(df[column].dropna().astype(str).tolist())
+
+
+def default_form_config(df=None):
+    return {
+        "revision_options": DEFAULT_REVISION_OPTIONS.copy(),
+        "code_status_map": DEFAULT_CODE_TO_DCI_STATUS.copy(),
+        "discipline_options": _values_from_documents(df, "discipline"),
+        "vendor_options": _values_from_documents(df, "poc"),
+    }
+
+
+def normalize_form_config(value, df=None):
+    defaults = default_form_config(df)
+    if not isinstance(value, dict):
+        return defaults
+
+    revisions = _clean_unique_options(value.get("revision_options"))
+    disciplines = _clean_unique_options(value.get("discipline_options"))
+    vendors = _clean_unique_options(value.get("vendor_options"))
+
+    code_status_map = {}
+    raw_map = value.get("code_status_map") or {}
+    if isinstance(raw_map, dict):
+        for code, status in raw_map.items():
+            clean_code = normalize_code(code)
+            clean_status = " ".join(str(status or "").strip().upper().split())
+            if clean_code and clean_status:
+                code_status_map[clean_code] = clean_status
+
+    return {
+        "revision_options": revisions or defaults["revision_options"],
+        "code_status_map": code_status_map or defaults["code_status_map"],
+        "discipline_options": disciplines or defaults["discipline_options"],
+        "vendor_options": vendors or defaults["vendor_options"],
+    }
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_form_config(_supabase, _df_signature=None):
+    try:
+        result = (
+            _supabase.table("dashboard_settings")
+            .select("setting_value")
+            .eq("setting_key", FORM_CONFIG_KEY)
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            return result.data[0].get("setting_value") or {}
+    except Exception:
+        pass
+    return {}
+
+
+def save_form_config(supabase, config):
+    normalized = normalize_form_config(config)
+    supabase.table("dashboard_settings").upsert(
+        {
+            "setting_key": FORM_CONFIG_KEY,
+            "setting_value": normalized,
+            "updated_by": "admin-user",
+            "updated_at": datetime.now().isoformat(),
+        },
+        on_conflict="setting_key",
+    ).execute()
+    st.cache_data.clear()
+    return normalized
 
 ROOT_CAUSE_NOTES = [
     "Change in Tank Anchor Plate Design",
@@ -187,9 +289,9 @@ def parse_workbook_bytes(file_bytes):
                 {
                     "doc_no": rec["doc_no"],
                     "rev_no": rev_no,
-                    "uploaded_date": _jsonable(uploaded),
+                    "uploaded_date": _date_jsonable(uploaded),
                     "code": code,
-                    "from_eil_date": _jsonable(from_eil),
+                    "from_eil_date": _date_jsonable(from_eil),
                 }
             )
         rec["_history_rows"] = row_history
@@ -199,10 +301,40 @@ def parse_workbook_bytes(file_bytes):
 
 
 def _jsonable(value):
-    """Make an openpyxl cell value safe to store in JSONB (dates -> isoformat)."""
+    """Make an openpyxl cell value safe to store in JSONB."""
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     return value
+
+
+def _date_jsonable(value):
+    """Return an ISO date string only for genuine/parseable dates.
+
+    Excel sheets can contain return codes such as ``R`` or ``V`` in cells that
+    are expected to be dates. PostgreSQL rejects those values for DATE columns,
+    so invalid date-like values are deliberately stored as NULL.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value.date().isoformat()
+
+    # Avoid treating numeric return codes / Excel serials as calendar dates here.
+    # openpyxl normally converts correctly formatted Excel date cells already.
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    parsed = pd.to_datetime(text, errors="coerce", dayfirst=False)
+    if pd.isna(parsed):
+        return None
+    return parsed.date().isoformat()
 
 
 def validate_records(records):
@@ -366,9 +498,9 @@ def _bulk_import_documents(supabase, import_id, records, batch_size=200):
                 "revision": None if rec["latest_rev"] is None else str(rec["latest_rev"]),
                 "dci_status": rec["status"],
                 "returned_code": None if rec["latest_code"] is None else str(rec["latest_code"]),
-                "planned_submission_date": _jsonable(rec["schedule_submission_date"]),
-                "actual_submission_date": _jsonable(rec["latest_uploaded_date"]),
-                "review_date": _jsonable(rec["latest_from_eil_date"]),
+                "planned_submission_date": _date_jsonable(rec["schedule_submission_date"]),
+                "actual_submission_date": _date_jsonable(rec["latest_uploaded_date"]),
+                "review_date": _date_jsonable(rec["latest_from_eil_date"]),
                 "approval_date": None,
                 "forecast_month": "",
                 "remarks": "",
@@ -1160,17 +1292,34 @@ else:
     df = pd.DataFrame(columns=RECORD_COLUMNS)
     hist = pd.DataFrame(columns=HISTORY_COLUMNS)
 
+# Load persisted form/master-data configuration. Existing workbook values are
+# retained as fallbacks so old documents never disappear from selectors.
+_df_signature = (len(df), tuple(sorted(df["discipline"].dropna().astype(str).unique())) if has_data else (),
+                 tuple(sorted(df["poc"].dropna().astype(str).unique())) if has_data else ())
+_stored_form_config = load_form_config(supabase, _df_signature)
+form_config = normalize_form_config(_stored_form_config, df if has_data else None)
+REVISION_OPTIONS = form_config["revision_options"]
+CODE_TO_DCI_STATUS = form_config["code_status_map"]
+RETURNED_CODE_OPTIONS = list(CODE_TO_DCI_STATUS.keys())
+CONFIGURED_DISCIPLINES = form_config["discipline_options"]
+CONFIGURED_VENDORS = form_config["vendor_options"]
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("Filters")
 
 if has_data:
-    disciplines = sorted([d for d in df["discipline"].dropna().unique()])
-    vendors = sorted([v for v in df["poc"].dropna().unique()])
+    # Master-data options come from Admin Configuration. Values already used by
+    # imported documents are appended so legacy records remain filterable.
+    disciplines = _clean_unique_options(CONFIGURED_DISCIPLINES + _values_from_documents(df, "discipline"))
+    vendors = _clean_unique_options(CONFIGURED_VENDORS + _values_from_documents(df, "poc"))
     statuses = sorted([s for s in df["status_clean"].dropna().unique()])
     code_buckets = sorted([c for c in df["code_bucket"].dropna().unique()])
-    revisions = sorted([r for r in df["latest_rev_display"].unique() if r != ""], key=str.casefold)
+    revisions = _clean_unique_options(REVISION_OPTIONS + [r for r in df["latest_rev_display"].unique() if r != ""])
 else:
-    disciplines = vendors = statuses = code_buckets = revisions = []
+    disciplines = CONFIGURED_DISCIPLINES
+    vendors = CONFIGURED_VENDORS
+    statuses = code_buckets = []
+    revisions = REVISION_OPTIONS
 aging_buckets = AGING_BUCKET_ORDER
 
 f_discipline = st.sidebar.multiselect("Discipline", disciplines)
@@ -1595,112 +1744,231 @@ try:
             default_idx = 0
             preselected = st.session_state.get("selected_doc_no")
             if preselected:
-                matching = [i for i, label in enumerate(option_labels) if label == preselected or label.startswith(f"{preselected} —")]
-                if matching:
-                    default_idx = matching[0]
+                matches = [i for i, label in enumerate(option_labels)
+                           if label == preselected or label.startswith(f"{preselected} —")]
+                if matches:
+                    default_idx = matches[0]
 
-            selected_label = st.selectbox(
-                "Document", option_labels, index=default_idx, key="update_doc_select"
-            )
+            selected_label = st.selectbox("Document", option_labels, index=default_idx, key="update_doc_select")
             document_id = id_by_label.get(selected_label)
 
             if document_id is not None:
                 doc_row = df[df["document_id"] == document_id].iloc[0]
-                selected_doc_no = doc_row["doc_no"]
 
-                st.markdown("#### Current Information (read-only)")
-                ro1, ro2, ro3 = st.columns(3)
-                ro1.text_input("Document Number", value=doc_row["doc_no"], disabled=True)
-                ro1.text_input("Discipline", value=doc_row["discipline"] or "", disabled=True)
-                ro2.text_input("Document Title", value=doc_row["title"] or "", disabled=True)
-                ro2.text_input("Vendor / POC", value=doc_row["poc"] or "", disabled=True)
-                ro3.text_input("Original Row Number", value=str(doc_row["original_row_number"]), disabled=True)
-                ro3.text_input("Stable Document Key", value=str(doc_row["document_key"]), disabled=True)
+                st.markdown("#### Current Information")
+                info1, info2 = st.columns(2)
+                info1.text_input("Document Number", value=str(doc_row["doc_no"] or ""), disabled=True,
+                                 key=f"document_number_readonly_{document_id}")
+                info2.text_input("Document Title", value=str(doc_row["title"] or ""), disabled=True,
+                                 key=f"document_title_readonly_{document_id}")
 
-                st.markdown("#### Editable Fields")
-                with st.form("document_update_form"):
-                    fc1, fc2 = st.columns(2)
-                    with fc1:
-                        cur_status = doc_row["status"] if doc_row["status"] in STATUS_OPTIONS else STATUS_OPTIONS[0]
-                        new_status = st.selectbox("DCI Status", STATUS_OPTIONS, index=STATUS_OPTIONS.index(cur_status))
-                        new_revision = st.text_input("Revision", value="" if pd.isna(doc_row["latest_rev"]) else str(doc_row["latest_rev"]))
-                        cur_code = normalize_code(doc_row["latest_code"])
-                        code_idx = RETURNED_CODE_OPTIONS.index(cur_code) if cur_code in RETURNED_CODE_OPTIONS else 0
-                        new_code = st.selectbox("Returned Code", RETURNED_CODE_OPTIONS, index=code_idx)
-                        new_forecast_month = st.text_input("Forecast Month", value=doc_row["forecast_month"] or "")
-                        new_assigned_engineer = st.text_input("Assigned Engineer", value=doc_row["assigned_engineer"] or "")
-                        new_action_owner = st.text_input("Action Owner", value=doc_row["action_owner"] or "")
-                    with fc2:
-                        def _safe_date(v):
-                            ts = pd.to_datetime(v, errors="coerce")
-                            return None if pd.isna(ts) else ts.date()
+                current_discipline = str(doc_row["discipline"] or "").strip()
+                current_vendor = str(doc_row["poc"] or "").strip()
 
-                        new_planned = st.date_input("Planned Submission Date", value=_safe_date(doc_row["schedule_submission_date"]))
-                        new_actual = st.date_input("Actual Submission Date", value=_safe_date(doc_row["latest_uploaded_date"]))
-                        new_review = st.date_input("Review Date", value=_safe_date(doc_row["latest_from_eil_date"]))
-                        new_approval = st.date_input("Approval Date", value=_safe_date(doc_row["approval_date"]))
-                        new_expected_completion = st.date_input("Expected Completion Date", value=_safe_date(doc_row["expected_completion_date"]))
+                info3, info4 = st.columns(2)
+                info3.text_input(
+                    "Discipline", value=current_discipline, disabled=True,
+                    key=f"discipline_readonly_{document_id}",
+                )
+                info4.text_input(
+                    "Vendor / Consultant (POC)", value=current_vendor, disabled=True,
+                    key=f"vendor_readonly_{document_id}",
+                )
 
-                    new_remarks = st.text_area("Remarks", value=doc_row["remarks"] or "")
+                st.markdown("#### Revision Update")
+                st.caption(
+                    "Choose the configured values and dates. DCI Status is calculated automatically from Return Code."
+                )
 
-                    preview_clicked = st.form_submit_button("Save Changes")
+                current_revision = "" if pd.isna(doc_row["latest_rev"]) else str(doc_row["latest_rev"]).strip()
+                revision_choices = _clean_unique_options(REVISION_OPTIONS + [current_revision])
+                current_code = normalize_code(doc_row["latest_code"])
+                code_choices = _clean_unique_options(RETURNED_CODE_OPTIONS + [current_code])
 
-                if preview_clicked:
+                def _safe_date(v):
+                    ts = pd.to_datetime(v, errors="coerce")
+                    return None if pd.isna(ts) else ts.date()
+
+                left, right = st.columns(2)
+                with left:
+                    new_revision = st.selectbox(
+                        "Revision", revision_choices,
+                        index=revision_choices.index(current_revision) if current_revision in revision_choices else 0,
+                        key=f"revision_{document_id}",
+                    )
+                    new_code = st.selectbox(
+                        "Return Code", code_choices,
+                        index=code_choices.index(current_code) if current_code in code_choices else 0,
+                        key=f"return_code_{document_id}",
+                    )
+                    derived_status = CODE_TO_DCI_STATUS.get(new_code, "UNMAPPED")
+                    st.text_input("DCI Status (automatic)", value=derived_status, disabled=True,
+                                  key=f"derived_status_{document_id}_{new_code}")
+                with right:
+                    revision_date = st.date_input(
+                        "Revision Date", value=_safe_date(doc_row["latest_uploaded_date"]),
+                        key=f"revision_date_{document_id}",
+                    )
+                    return_date = st.date_input(
+                        "Return Date", value=_safe_date(doc_row["latest_from_eil_date"]),
+                        key=f"return_date_{document_id}",
+                    )
+
+                validation_errors = []
+                if not new_revision:
+                    validation_errors.append("A revision must be selected.")
+                if not new_code:
+                    validation_errors.append("A return code must be selected.")
+                if derived_status == "UNMAPPED":
+                    validation_errors.append("This return code has no DCI Status mapping. Ask an administrator to configure it.")
+                if return_date and revision_date and return_date < revision_date:
+                    validation_errors.append("Return Date cannot be earlier than Revision Date.")
+                for message in validation_errors:
+                    st.error(message)
+
+                st.markdown("#### Comments")
+                existing_remarks = "" if pd.isna(doc_row.get("remarks")) else str(doc_row.get("remarks") or "")
+                if existing_remarks:
+                    with st.expander("View existing comments", expanded=False):
+                        st.text(existing_remarks)
+                else:
+                    st.caption("No additional comments have been added.")
+                new_comment = st.text_area(
+                    "Add Comment", placeholder="Enter an optional comment for this revision update…",
+                    key=f"new_comment_{document_id}",
+                )
+
+                if st.button("Save Revision Update", type="primary", disabled=bool(validation_errors),
+                             key=f"save_revision_{document_id}"):
+                    remarks_value = existing_remarks
+                    clean_comment = new_comment.strip() if new_comment else ""
+                    if clean_comment:
+                        stamp = datetime.now().strftime("%d %b %Y %H:%M")
+                        remarks_value = (existing_remarks + "\n" + f"[{stamp}] {clean_comment}").strip()
+
                     form_values = {
-                        "status": new_status, "latest_rev": new_revision, "latest_code": new_code,
-                        "forecast_month": new_forecast_month, "assigned_engineer": new_assigned_engineer,
-                        "action_owner": new_action_owner, "schedule_submission_date": new_planned,
-                        "latest_uploaded_date": new_actual, "latest_from_eil_date": new_review,
-                        "approval_date": new_approval, "expected_completion_date": new_expected_completion,
-                        "remarks": new_remarks,
+                        "status": derived_status,
+                        "latest_rev": new_revision,
+                        "latest_code": new_code,
+                        "latest_uploaded_date": revision_date,
+                        "latest_from_eil_date": return_date,
                     }
-                    st.session_state["pending_doc_changes"] = (document_id, form_values, doc_row.to_dict())
+                    if clean_comment:
+                        form_values["remarks"] = remarks_value
 
-                pending = st.session_state.get("pending_doc_changes")
-                if pending and pending[0] == document_id:
-                    _, form_values, current_record = pending
-                    changes_preview = [
-                        {
-                            "Field": item["field"],
-                            "Current Value": item["old"] or "(blank)",
-                            "New Value": item["new"] or "(blank)",
-                        }
-                        for item in build_change_diff(form_values, current_record)
-                    ]
-
-                    if not changes_preview:
-                        st.info("No changes detected.")
-                        st.session_state.pop("pending_doc_changes", None)
+                    changed, diff = save_document_changes(
+                        supabase, document_id, form_values, doc_row.to_dict(),
+                        changed_by="dashboard-user", event_type="revision_updated",
+                    )
+                    if changed:
+                        st.success(f"Saved {len(diff)} change(s) to {doc_row['doc_no']}.")
+                        st.rerun()
                     else:
-                        st.markdown("#### Change Preview")
-                        st.dataframe(pd.DataFrame(changes_preview), use_container_width=True, hide_index=True)
-                        cc1, cc2 = st.columns([1, 4])
-                        if cc1.button("Confirm Save", type="primary"):
-                            changed, diff = save_document_changes(
-                                supabase, document_id, form_values, current_record,
-                                changed_by="dashboard-user", event_type="field_updated",
-                            )
-                            st.session_state.pop("pending_doc_changes", None)
-                            if changed:
-                                st.success(f"Saved {len(diff)} change(s) to {selected_doc_no}.")
-                                st.rerun()
-                            else:
-                                st.info("No changes detected.")
-                        if cc2.button("Discard"):
-                            st.session_state.pop("pending_doc_changes", None)
-                            st.rerun()
+                        st.info("No changes were detected.")
 
                 st.markdown("---")
-                st.markdown("#### Recent History")
-                recent = get_document_history(supabase, document_id)
-                if recent:
-                    recent_df = pd.DataFrame(recent[-10:][::-1])
-                    show_cols = [c for c in ["changed_at", "event_type", "field_name", "old_value", "new_value", "changed_by"] if c in recent_df.columns]
-                    st.dataframe(recent_df[show_cols], use_container_width=True, hide_index=True)
-                else:
-                    st.caption("No history yet for this document.")
+                with st.expander("⚙ Admin Configuration", expanded=False):
+                    st.caption(
+                        "The password protects master-data configuration only. Normal document updates remain available without it."
+                    )
+                    admin_password = get_admin_password()
+                    unlock_key = "master_data_configuration_unlocked"
 
-    # ------------------------------------------------------------------
+                    if not admin_password_configured():
+                        st.error(
+                            "ADMIN_PASSWORD is not configured. Add it to `.streamlit/secrets.toml` "
+                            "or the ADMIN_PASSWORD environment variable, then restart the app."
+                        )
+                    elif not st.session_state.get(unlock_key, False):
+                        entered_password = st.text_input("Admin password", type="password",
+                                                         key="master_data_configuration_password")
+                        if st.button("Unlock Configuration", key="unlock_master_data_configuration"):
+                            if entered_password == admin_password:
+                                st.session_state[unlock_key] = True
+                                st.rerun()
+                            else:
+                                st.error("Incorrect password.")
+                    else:
+                        top1, top2 = st.columns([4, 1])
+                        top1.success("Configuration is unlocked.")
+                        if top2.button("Lock", key="lock_master_data_configuration"):
+                            st.session_state[unlock_key] = False
+                            st.rerun()
+
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.markdown("##### Revision options")
+                            edited_revisions = st.data_editor(
+                                pd.DataFrame({"Revision": REVISION_OPTIONS}), num_rows="dynamic",
+                                hide_index=True, use_container_width=True, key="revision_options_editor",
+                            )
+                            st.markdown("##### Discipline options")
+                            edited_disciplines = st.data_editor(
+                                pd.DataFrame({"Discipline": CONFIGURED_DISCIPLINES}), num_rows="dynamic",
+                                hide_index=True, use_container_width=True, key="discipline_options_editor",
+                            )
+                        with c2:
+                            st.markdown("##### Return-code → DCI-status mapping")
+                            edited_mapping = st.data_editor(
+                                pd.DataFrame([{"Return Code": c, "DCI Status": v}
+                                              for c, v in CODE_TO_DCI_STATUS.items()]),
+                                num_rows="dynamic", hide_index=True, use_container_width=True,
+                                key="code_status_mapping_editor",
+                            )
+                            st.markdown("##### Vendor / Consultant options")
+                            edited_vendors = st.data_editor(
+                                pd.DataFrame({"Vendor / Consultant": CONFIGURED_VENDORS}), num_rows="dynamic",
+                                hide_index=True, use_container_width=True, key="vendor_options_editor",
+                            )
+
+                        revision_values = _clean_unique_options(edited_revisions.get("Revision", []).tolist())
+                        discipline_values = _clean_unique_options(edited_disciplines.get("Discipline", []).tolist())
+                        vendor_values = _clean_unique_options(edited_vendors.get("Vendor / Consultant", []).tolist())
+                        raw_codes, new_mapping, config_errors = [], {}, []
+                        for _, row in edited_mapping.iterrows():
+                            code = normalize_code(row.get("Return Code"))
+                            status = " ".join(str(row.get("DCI Status") or "").strip().upper().split())
+                            if not code and not status:
+                                continue
+                            if not code or not status:
+                                config_errors.append("Every mapping row must contain both Return Code and DCI Status.")
+                                continue
+                            raw_codes.append(code)
+                            new_mapping[code] = status
+
+                        if not revision_values: config_errors.append("At least one revision option is required.")
+                        if not discipline_values: config_errors.append("At least one discipline option is required.")
+                        if not vendor_values: config_errors.append("At least one vendor option is required.")
+                        if not new_mapping: config_errors.append("At least one return-code mapping is required.")
+                        duplicates = sorted({x for x in raw_codes if raw_codes.count(x) > 1})
+                        if duplicates:
+                            config_errors.append("Duplicate return codes are not allowed: " + ", ".join(duplicates))
+                        for message in dict.fromkeys(config_errors):
+                            st.error(message)
+
+                        save_col, reset_col = st.columns(2)
+                        if save_col.button("Save Configuration", type="primary",
+                                           disabled=bool(config_errors), key="save_master_data_configuration"):
+                            try:
+                                save_form_config(supabase, {
+                                    "revision_options": revision_values,
+                                    "code_status_map": new_mapping,
+                                    "discipline_options": discipline_values,
+                                    "vendor_options": vendor_values,
+                                })
+                                st.success("Configuration saved. Update-form and sidebar options are now refreshed.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error("Could not save configuration. Ensure dashboard_settings exists. " + str(exc))
+
+                        if reset_col.button("Reset to Workbook Defaults", key="reset_master_data_configuration"):
+                            try:
+                                save_form_config(supabase, default_form_config(df))
+                                st.success("Configuration reset from the current workbook.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error("Could not reset configuration: " + str(exc))
+
     # TAB 11: DOCUMENT TIMELINE
     # ------------------------------------------------------------------
     with tabs[10]:
