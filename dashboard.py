@@ -55,7 +55,7 @@ RECORD_COLUMNS = [
     "document_key", "document_id", "original_row_number",
 ]
 
-HISTORY_COLUMNS = ["doc_no", "rev_no", "uploaded_date", "code", "from_eil_date"]
+HISTORY_COLUMNS = ["document_id", "doc_no", "rev_no", "uploaded_date", "code", "from_eil_date"]
 
 NUMERIC_COLUMNS = [
     "eil_mandays", "eil_manhours", "stspl_mandays",
@@ -473,7 +473,9 @@ def load_documents(_supabase, import_id):
         records.append(record)
 
         for h in (row_data.get("history_rows") or []):
-            history.append(h)
+            history_item = dict(h)
+            history_item["document_id"] = doc["id"]
+            history.append(history_item)
 
     df = pd.DataFrame(records)
     for col in RECORD_COLUMNS:
@@ -866,6 +868,135 @@ def derive_history(hist):
     hist["uploaded_month"] = hist["uploaded_date"].dt.to_period("M").astype(str)
     hist["returned_month"] = hist["from_eil_date"].dt.to_period("M").astype(str)
     return hist
+
+
+def _timeline_date(value):
+    """Return a timezone-naive Timestamp for safe timeline sorting."""
+    ts = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(ts):
+        return pd.NaT
+    return ts.tz_convert(None)
+
+
+def _revision_sort_key(value):
+    """Sort common revision values naturally: 0, 1, 2, A, B, etc."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return (2, "")
+    text = str(value).strip()
+    try:
+        return (0, float(text))
+    except ValueError:
+        return (1, text.casefold())
+
+
+def build_document_timeline(revision_history, audit_events):
+    """Merge Excel revision history with later Supabase audit events.
+
+    Excel dates represent the real document lifecycle. The import audit event only
+    represents when that historical record was added to this dashboard.
+    """
+    timeline = []
+
+    if revision_history is not None and not revision_history.empty:
+        revisions = revision_history.copy()
+        revisions = revisions.sort_values(
+            by="rev_no", key=lambda col: col.map(_revision_sort_key)
+        )
+
+        for _, rev in revisions.iterrows():
+            rev_text = "" if pd.isna(rev.get("rev_no")) else str(rev.get("rev_no")).strip()
+            code = normalize_code(rev.get("code"))
+            uploaded = _timeline_date(rev.get("uploaded_date"))
+            returned = _timeline_date(rev.get("from_eil_date"))
+
+            if pd.notna(uploaded):
+                timeline.append({
+                    "event_date": uploaded,
+                    "event": "Revision submitted",
+                    "revision": rev_text,
+                    "code": "",
+                    "status": "Submitted to EIL",
+                    "details": f"Revision {rev_text or 'N/A'} uploaded/submitted for review.",
+                    "source": "Excel revision history",
+                })
+
+            if pd.notna(returned):
+                bucket = classify_code(code)
+                if bucket in ("Approved (Code 1)", "Retained for Record (Code R)"):
+                    event_name = "Revision approved"
+                elif bucket == "Void":
+                    event_name = "Revision voided"
+                else:
+                    event_name = "Revision returned by EIL"
+
+                details = f"EIL returned Revision {rev_text or 'N/A'}"
+                if code:
+                    details += f" with Code {code}"
+                if pd.notna(uploaded):
+                    turnaround = (returned.normalize() - uploaded.normalize()).days
+                    if turnaround >= 0:
+                        details += f" after {turnaround} day{'s' if turnaround != 1 else ''}"
+                details += "."
+
+                timeline.append({
+                    "event_date": returned,
+                    "event": event_name,
+                    "revision": rev_text,
+                    "code": code,
+                    "status": bucket,
+                    "details": details,
+                    "source": "Excel revision history",
+                })
+
+            # Preserve partially populated revision blocks instead of hiding them.
+            if pd.isna(uploaded) and pd.isna(returned) and (rev_text or code):
+                timeline.append({
+                    "event_date": pd.NaT,
+                    "event": "Revision information recorded",
+                    "revision": rev_text,
+                    "code": code,
+                    "status": classify_code(code),
+                    "details": "Revision data exists in Excel, but no usable event date was available.",
+                    "source": "Excel revision history",
+                })
+
+    for ev in audit_events or []:
+        event_type = ev.get("event_type") or "updated"
+        changed_at = _timeline_date(ev.get("changed_at"))
+
+        if event_type == "imported":
+            timeline.append({
+                "event_date": changed_at,
+                "event": "Added to dashboard",
+                "revision": "" if ev.get("revision") is None else str(ev.get("revision")),
+                "code": normalize_code(ev.get("returned_code")),
+                "status": ev.get("status") or "",
+                "details": "The existing Excel document and its earlier revision history were imported into Supabase.",
+                "source": "Dashboard audit log",
+            })
+            continue
+
+        field_name = (ev.get("field_name") or "document").replace("_", " ").title()
+        old_value = ev.get("old_value")
+        new_value = ev.get("new_value")
+        if old_value is not None or new_value is not None:
+            details = f"{field_name}: {old_value or '(blank)'} → {new_value or '(blank)'}"
+        else:
+            details = field_name
+
+        timeline.append({
+            "event_date": changed_at,
+            "event": event_type.replace("_", " ").title(),
+            "revision": "" if ev.get("revision") is None else str(ev.get("revision")),
+            "code": normalize_code(ev.get("returned_code")),
+            "status": ev.get("status") or "",
+            "details": details,
+            "source": "Dashboard audit log",
+        })
+
+    # Dated events first in chronological order; incomplete undated Excel rows last.
+    timeline.sort(key=lambda e: (pd.isna(e["event_date"]), e["event_date"] if pd.notna(e["event_date"]) else pd.Timestamp.max))
+    return timeline
 
 
 # ----------------------------------------------------------------------------
@@ -1596,38 +1727,58 @@ try:
                 timeline_doc_no = doc_row["doc_no"]
                 st.caption(f"{doc_row['title'] or ''}  |  Discipline: {doc_row['discipline'] or 'N/A'}  |  Vendor: {doc_row['poc'] or 'N/A'}")
 
-                events = get_document_history(supabase, document_id)
-                if not events:
-                    st.info("No history events recorded for this document yet.")
-                else:
-                    for i, ev in enumerate(events):
-                        label = ev["event_type"].replace("_", " ").title()
-                        if ev.get("field_name"):
-                            label += f" — {ev['field_name'].replace('_', ' ').title()}"
-                        ts = ev.get("changed_at", "")
-                        try:
-                            ts_display = pd.to_datetime(ts).strftime("%d %b %Y, %H:%M")
-                        except Exception:
-                            ts_display = ts
+                audit_events = get_document_history(supabase, document_id)
+                revision_history = hist[hist["document_id"] == document_id].copy()
+                timeline_events = build_document_timeline(revision_history, audit_events)
 
-                        marker = "●" if i < len(events) - 1 else "◉"
-                        bar = "│" if i < len(events) - 1 else " "
-                        st.markdown(f"**{marker} {label}**")
-                        details = []
-                        if ev.get("old_value") or ev.get("new_value"):
-                            details.append(f"{ev.get('old_value') or '(blank)'} → {ev.get('new_value') or '(blank)'}")
-                        if ev.get("revision"):
-                            details.append(f"Rev {ev['revision']}")
+                if not timeline_events:
+                    st.info("No revision dates or dashboard history were found for this document.")
+                else:
+                    st.caption(
+                        "Historical submission and EIL-return events are reconstructed from the "
+                        "revision blocks in the imported Excel file. Dashboard edits are then added "
+                        "from the Supabase audit log."
+                    )
+
+                    for i, ev in enumerate(timeline_events):
+                        is_last = i == len(timeline_events) - 1
+                        marker = "◉" if is_last else "●"
+                        bar = " " if is_last else "│"
+                        ts = ev["event_date"]
+                        ts_display = "Date unavailable" if pd.isna(ts) else ts.strftime("%d %b %Y")
+
+                        revision_label = f" — Revision {ev['revision']}" if ev.get("revision") else ""
+                        st.markdown(f"**{marker} {ev['event']}{revision_label}**")
+
+                        meta = [ts_display]
+                        if ev.get("code"):
+                            meta.append(f"Code: {ev['code']}")
                         if ev.get("status"):
-                            details.append(f"Status: {ev['status']}")
-                        if ev.get("changed_by"):
-                            details.append(f"By: {ev['changed_by']}")
-                        st.caption(f"{ts_display}" + ("  |  " + "  |  ".join(details) if details else ""))
-                        st.markdown(bar)
+                            meta.append(f"Status: {ev['status']}")
+                        st.caption("  |  ".join(meta))
+                        st.write(ev["details"])
+                        if not is_last:
+                            st.markdown("│")
 
                     st.markdown("---")
-                    st.markdown("#### Full History Table")
-                    st.dataframe(pd.DataFrame(events), use_container_width=True, hide_index=True)
+                    st.markdown("#### Revision-wise History Table")
+                    timeline_df = pd.DataFrame(timeline_events).rename(columns={
+                        "event_date": "Date",
+                        "event": "Event",
+                        "revision": "Revision",
+                        "code": "Returned Code",
+                        "status": "Status",
+                        "details": "Details",
+                        "source": "Source",
+                    })
+                    timeline_df["Date"] = timeline_df["Date"].apply(
+                        lambda value: "" if pd.isna(value) else value.strftime("%d-%b-%Y")
+                    )
+                    st.dataframe(
+                        timeline_df[["Date", "Revision", "Event", "Returned Code", "Status", "Details", "Source"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
     # ------------------------------------------------------------------
     # TAB 12: IMPORT / EXPORT
