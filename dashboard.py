@@ -14,8 +14,7 @@ import hmac
 import os
 import io
 import zipfile
-import secrets
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date
 
 import numpy as np
 import pandas as pd
@@ -26,40 +25,6 @@ import streamlit as st
 # PAGE CONFIG
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="DCI Project Hub", layout="wide")
-
-
-def _early_secret(name):
-    try:
-        value = st.secrets.get(name)
-    except Exception:
-        value = None
-    return str(value or os.getenv(name, "")).strip()
-
-
-try:
-    from streamlit_cookies_manager import EncryptedCookieManager
-except ImportError:
-    st.error(
-        "Persistent sign-in requires `streamlit-cookies-manager`. "
-        "Add `streamlit-cookies-manager==0.2.0` to requirements.txt and redeploy."
-    )
-    st.stop()
-
-_COOKIE_PASSWORD = _early_secret("COOKIES_PASSWORD")
-if not _COOKIE_PASSWORD:
-    st.error("COOKIES_PASSWORD is not configured in Streamlit secrets or the environment.")
-    st.stop()
-
-AUTH_COOKIES = EncryptedCookieManager(
-    prefix="dci-project-hub/",
-    password=_COOKIE_PASSWORD,
-)
-if not AUTH_COOKIES.ready():
-    st.stop()
-
-AUTH_COOKIE_NAME = "app_session"
-ACCOUNT_SESSION_DAYS = 30
-MASTER_SESSION_HOURS = 8
 
 
 APPROVED_CODES = {"1", "1 WITH COMMENTS"}
@@ -215,8 +180,6 @@ def load_form_config(_supabase, _df_signature=None):
 
 
 def save_form_config(supabase, config):
-    if not globals().get("CAN_ADMIN", False):
-        raise PermissionError("Admin access is required to change form configuration.")
     normalized = normalize_form_config(config)
     supabase.table("dashboard_settings").upsert(
         {
@@ -259,659 +222,6 @@ def get_supabase():
         return None
     return create_client(url, key)
 
-
-@st.cache_resource
-def get_auth_supabase():
-    """Public Supabase client used only for end-user authentication."""
-    from supabase import create_client
-
-    try:
-        url = st.secrets.get("SUPABASE_URL")
-        anon_key = st.secrets.get("SUPABASE_ANON_KEY")
-    except Exception:
-        url = os.getenv("SUPABASE_URL")
-        anon_key = os.getenv("SUPABASE_ANON_KEY")
-    if not url or not anon_key:
-        return None
-    return create_client(url, anon_key)
-
-
-def _get_secret(name):
-    try:
-        value = st.secrets.get(name)
-    except Exception:
-        value = None
-    return str(value or os.getenv(name, "")).strip()
-
-
-def _master_key():
-    return _get_secret("MASTER_ACCESS_KEY")
-
-
-def _session_token_hash(token):
-    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
-
-
-def _cookie_session_token():
-    try:
-        return str(AUTH_COOKIES.get(AUTH_COOKIE_NAME) or "").strip()
-    except Exception:
-        return ""
-
-
-def _write_session_cookie(token):
-    AUTH_COOKIES[AUTH_COOKIE_NAME] = str(token)
-    AUTH_COOKIES.save()
-
-
-def _delete_session_cookie():
-    try:
-        if AUTH_COOKIE_NAME in AUTH_COOKIES:
-            del AUTH_COOKIES[AUTH_COOKIE_NAME]
-            AUTH_COOKIES.save()
-    except Exception:
-        pass
-
-
-def _revoke_persistent_session(service_client):
-    token = _cookie_session_token()
-    if token:
-        try:
-            service_client.table("app_sessions").update({
-                "revoked_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("token_hash", _session_token_hash(token)).execute()
-        except Exception:
-            pass
-    _delete_session_cookie()
-
-
-def _create_persistent_session(service_client, context):
-    """Create a server-tracked opaque browser session.
-
-    The browser receives only a random opaque token. Supabase refresh/access tokens
-    are never placed in the browser cookie. A stolen database dump does not reveal
-    usable browser tokens because only SHA-256 hashes are stored.
-    """
-    raw_token = secrets.token_urlsafe(48)
-    now = datetime.now(timezone.utc)
-    is_master = context.get("mode") == "master"
-    expires_at = now + (timedelta(hours=MASTER_SESSION_HOURS) if is_master else timedelta(days=ACCOUNT_SESSION_DAYS))
-    service_client.table("app_sessions").insert({
-        "token_hash": _session_token_hash(raw_token),
-        "user_id": context.get("user_id"),
-        "access_mode": "master" if is_master else "account",
-        "expires_at": expires_at.isoformat(),
-        "created_at": now.isoformat(),
-        "last_seen_at": now.isoformat(),
-    }).execute()
-    _write_session_cookie(raw_token)
-
-
-def _clear_access_session(service_client=None, revoke=True):
-    if revoke and service_client is not None:
-        _revoke_persistent_session(service_client)
-    for key in (
-        "access_context", "auth_access_token", "auth_refresh_token",
-        "active_project_id", "show_project_home", "pending_doc_changes",
-        "master_data_configuration_unlocked",
-    ):
-        st.session_state.pop(key, None)
-
-
-def _profile_for_user(service_client, user_id):
-    result = (
-        service_client.table("user_profiles")
-        .select("*")
-        .eq("id", str(user_id))
-        .limit(1)
-        .execute()
-    )
-    return result.data[0] if result.data else None
-
-
-def _ensure_profile(service_client, user, full_name=""):
-    if user is None:
-        return None
-    existing = _profile_for_user(service_client, user.id)
-    if existing:
-        return existing
-    metadata = getattr(user, "user_metadata", None) or {}
-    row = {
-        "id": str(user.id),
-        "email": getattr(user, "email", None),
-        "full_name": str(full_name or metadata.get("full_name") or "").strip() or None,
-        "role": "viewer",
-        "approval_status": "pending",
-        "is_active": True,
-    }
-    service_client.table("user_profiles").upsert(row, on_conflict="id").execute()
-    return _profile_for_user(service_client, user.id)
-
-
-def _set_user_access(user, session, profile):
-    st.session_state["auth_access_token"] = getattr(session, "access_token", None)
-    st.session_state["auth_refresh_token"] = getattr(session, "refresh_token", None)
-    st.session_state["access_context"] = {
-        "mode": "account",
-        "user_id": str(user.id),
-        "email": getattr(user, "email", "") or "",
-        "name": (profile or {}).get("full_name") or getattr(user, "email", "") or "User",
-        "role": (profile or {}).get("role") or "viewer",
-        "approval_status": (profile or {}).get("approval_status") or "pending",
-        "is_active": bool((profile or {}).get("is_active", True)),
-    }
-
-
-def _refresh_access_profile(service_client):
-    context = st.session_state.get("access_context") or {}
-    if context.get("mode") != "account" or not context.get("user_id"):
-        return context
-    profile = _profile_for_user(service_client, context["user_id"])
-    if profile:
-        context.update({
-            "name": profile.get("full_name") or context.get("email") or "User",
-            "email": profile.get("email") or context.get("email") or "",
-            "role": profile.get("role") or "viewer",
-            "approval_status": profile.get("approval_status") or "pending",
-            "is_active": bool(profile.get("is_active", True)),
-        })
-        st.session_state["access_context"] = context
-    return context
-
-
-def _restore_persistent_access(service_client):
-    if st.session_state.get("access_context"):
-        return _refresh_access_profile(service_client)
-    raw_token = _cookie_session_token()
-    if not raw_token:
-        return {}
-    token_hash = _session_token_hash(raw_token)
-    result = (
-        service_client.table("app_sessions")
-        .select("*")
-        .eq("token_hash", token_hash)
-        .is_("revoked_at", "null")
-        .limit(1)
-        .execute()
-    )
-    row = result.data[0] if result.data else None
-    now = datetime.now(timezone.utc)
-    if not row:
-        _delete_session_cookie()
-        return {}
-    expires_at = pd.to_datetime(row.get("expires_at"), utc=True, errors="coerce")
-    if pd.isna(expires_at) or expires_at.to_pydatetime() <= now:
-        service_client.table("app_sessions").update({"revoked_at": now.isoformat()}).eq("id", row["id"]).execute()
-        _delete_session_cookie()
-        return {}
-
-    if row.get("access_mode") == "master":
-        context = {
-            "mode": "master", "user_id": None, "email": "master-access",
-            "name": "Master Access", "role": "master",
-            "approval_status": "approved", "is_active": True,
-        }
-    else:
-        profile = _profile_for_user(service_client, row.get("user_id"))
-        if not profile:
-            _delete_session_cookie()
-            return {}
-        context = {
-            "mode": "account",
-            "user_id": str(profile["id"]),
-            "email": profile.get("email") or "",
-            "name": profile.get("full_name") or profile.get("email") or "User",
-            "role": profile.get("role") or "viewer",
-            "approval_status": profile.get("approval_status") or "pending",
-            "is_active": bool(profile.get("is_active", True)),
-        }
-    st.session_state["access_context"] = context
-    service_client.table("app_sessions").update({"last_seen_at": now.isoformat()}).eq("id", row["id"]).execute()
-    return context
-
-
-def render_auth_gate(service_client):
-    """Sign-in, sign-up, approval gate, master override, and persistent sessions."""
-    auth_client = get_auth_supabase()
-    context = _restore_persistent_access(service_client)
-
-    if context:
-        if context.get("mode") == "master":
-            return context
-        if not context.get("is_active", True):
-            st.error("This account has been deactivated. Contact an administrator.")
-        elif context.get("approval_status") == "approved":
-            return context
-        elif context.get("approval_status") == "rejected":
-            st.error("This account request was rejected. Contact an administrator.")
-        else:
-            st.title("Account awaiting approval")
-            st.info(
-                f"You are signed in as **{context.get('email')}**, but an administrator "
-                "must approve your account and assign project access before you can open project data."
-            )
-        if st.button("Sign out"):
-            try:
-                if auth_client:
-                    auth_client.auth.sign_out()
-            except Exception:
-                pass
-            _clear_access_session(service_client)
-            st.rerun()
-        st.stop()
-
-    st.title("DCI Project Hub")
-    st.caption("Secure sign-in for project dashboards and document control.")
-    signin_tab, signup_tab, master_tab = st.tabs(["Sign in", "Sign up", "Master access"])
-
-    with signin_tab:
-        if auth_client is None:
-            st.error("SUPABASE_ANON_KEY is not configured, so account sign-in is unavailable.")
-        email = st.text_input("Email", key="signin_email")
-        password = st.text_input("Password", type="password", key="signin_password")
-        if st.button("Sign in", type="primary", disabled=auth_client is None, key="signin_button"):
-            try:
-                response = auth_client.auth.sign_in_with_password({
-                    "email": email.strip(), "password": password,
-                })
-                user = response.user
-                profile = _ensure_profile(service_client, user)
-                _set_user_access(user, response.session, profile)
-                _create_persistent_session(service_client, st.session_state["access_context"])
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Sign-in failed: {exc}")
-
-        reset_email = st.text_input("Password-reset email", key="reset_email")
-        if st.button("Send password reset", disabled=auth_client is None, key="reset_button"):
-            try:
-                auth_client.auth.reset_password_for_email(reset_email.strip())
-                st.success("If that account exists, Supabase has sent a password-reset email.")
-            except Exception as exc:
-                st.error(f"Could not send reset email: {exc}")
-
-    with signup_tab:
-        if auth_client is None:
-            st.error("SUPABASE_ANON_KEY is not configured, so account registration is unavailable.")
-        full_name = st.text_input("Full name", key="signup_name")
-        signup_email = st.text_input("Work email", key="signup_email")
-        signup_password = st.text_input("Create password", type="password", key="signup_password")
-        signup_password_2 = st.text_input("Confirm password", type="password", key="signup_password_2")
-        signup_errors = []
-        if signup_password and len(signup_password) < 8:
-            signup_errors.append("Password must contain at least 8 characters.")
-        if signup_password_2 and signup_password != signup_password_2:
-            signup_errors.append("The passwords do not match.")
-        for message in signup_errors:
-            st.error(message)
-        if st.button(
-            "Create account", type="primary", key="signup_button",
-            disabled=auth_client is None or bool(signup_errors),
-        ):
-            if not full_name.strip() or not signup_email.strip() or not signup_password:
-                st.error("Full name, email, and password are required.")
-            else:
-                try:
-                    response = auth_client.auth.sign_up({
-                        "email": signup_email.strip(),
-                        "password": signup_password,
-                        "options": {"data": {"full_name": full_name.strip()}},
-                    })
-                    if response.user:
-                        profile = _ensure_profile(service_client, response.user, full_name)
-                        if response.session:
-                            _set_user_access(response.user, response.session, profile)
-                            _create_persistent_session(service_client, st.session_state["access_context"])
-                            st.rerun()
-                        else:
-                            st.success(
-                                "Account created. Confirm your email if Supabase sent a verification message, "
-                                "then sign in. An administrator must approve the account and assign projects."
-                            )
-                except Exception as exc:
-                    st.error(f"Could not create account: {exc}")
-
-    with master_tab:
-        st.warning("Master access grants full control. It expires after eight hours.")
-        entered = st.text_input("Master key", type="password", key="master_access_key")
-        if not _master_key():
-            st.error("MASTER_ACCESS_KEY is not configured in secrets or the environment.")
-        if st.button("Enter with master access", type="primary", key="master_access_button"):
-            configured = _master_key()
-            if configured and hmac.compare_digest(entered, configured):
-                st.session_state["access_context"] = {
-                    "mode": "master", "user_id": None, "email": "master-access",
-                    "name": "Master Access", "role": "master",
-                    "approval_status": "approved", "is_active": True,
-                }
-                _create_persistent_session(service_client, st.session_state["access_context"])
-                st.rerun()
-            else:
-                st.error("Incorrect master key.")
-
-    st.stop()
-
-
-def _can_edit(context):
-    return context.get("role") in {"editor", "admin", "master"}
-
-
-def _can_admin(context):
-    return context.get("role") in {"admin", "master"}
-
-
-def _can_export(context):
-    return context.get("role") in {"viewer", "editor", "admin", "master"}
-
-
-def _actor_label(context):
-    if context.get("mode") == "master":
-        return "master-access"
-    return context.get("email") or context.get("name") or "authenticated-user"
-
-
-def _verify_admin_safety_check(context, entered_secret):
-    """Require fresh credentials before changing access controls."""
-    entered_secret = str(entered_secret or "")
-    if context.get("mode") == "master":
-        configured = _master_key()
-        return bool(configured and hmac.compare_digest(entered_secret, configured))
-    email = context.get("email") or ""
-    if not email or not entered_secret:
-        return False
-    try:
-        client = get_auth_supabase()
-        response = client.auth.sign_in_with_password({"email": email, "password": entered_secret})
-        return bool(response and response.user and str(response.user.id) == str(context.get("user_id")))
-    except Exception:
-        return False
-
-
-def _direct_project_ids(service_client, user_id):
-    result = service_client.table("user_project_access").select("project_id").eq("user_id", str(user_id)).execute()
-    return {row["project_id"] for row in (result.data or [])}
-
-
-def _group_project_ids(service_client, user_id):
-    membership = service_client.table("project_group_members").select("group_id").eq("user_id", str(user_id)).execute()
-    group_ids = [row["group_id"] for row in (membership.data or [])]
-    if not group_ids:
-        return set()
-    groups = service_client.table("project_groups").select("project_id").in_("id", group_ids).eq("is_active", True).execute()
-    return {row["project_id"] for row in (groups.data or [])}
-
-
-def accessible_project_ids(service_client, context):
-    if _can_admin(context):
-        return None
-    user_id = context.get("user_id")
-    if not user_id:
-        return set()
-    return _direct_project_ids(service_client, user_id) | _group_project_ids(service_client, user_id)
-
-
-def _user_group_ids(service_client, user_id):
-    result = service_client.table("project_group_members").select("group_id").eq("user_id", str(user_id)).execute()
-    return {row["group_id"] for row in (result.data or [])}
-
-
-def render_user_management(service_client):
-    """Advanced approval, project assignment, role and project-group management."""
-    st.subheader("User access management")
-    st.caption(
-        "Search for one account by name or email, then review and update that user's access. "
-        "Assign users directly to projects or place them in project groups."
-    )
-
-    projects = list_projects(service_client)
-    project_by_id = {p["id"]: p for p in projects}
-    project_label_to_id = {
-        f"{p.get('project_name') or 'Unnamed project'} · #{p['id']}": p["id"] for p in projects
-    }
-
-    st.markdown("#### Project groups")
-    groups_result = (
-        service_client.table("project_groups")
-        .select("*")
-        .eq("is_active", True)
-        .order("group_name")
-        .execute()
-    )
-    groups = groups_result.data or []
-
-    with st.container(border=True):
-        st.markdown("##### ＋ Create project group")
-        group_name = st.text_input("Group name", key="new_access_group_name")
-        group_project_label = st.selectbox(
-            "Project",
-            list(project_label_to_id.keys()) if project_label_to_id else ["No projects available"],
-            key="new_access_group_project",
-        )
-        group_description = st.text_area(
-            "Description",
-            placeholder="Example: Mechanical document-control team",
-            key="new_access_group_description",
-        )
-        if st.button("Create group", key="create_access_group", disabled=not project_label_to_id):
-            if not group_name.strip():
-                st.error("Group name is required.")
-            else:
-                service_client.table("project_groups").insert({
-                    "project_id": project_label_to_id[group_project_label],
-                    "group_name": group_name.strip(),
-                    "description": group_description.strip() or None,
-                    "created_by": CURRENT_ACTOR,
-                    "is_active": True,
-                }).execute()
-                st.success("Project group created.")
-                st.rerun()
-
-    if groups:
-        group_rows = []
-        for group in groups:
-            members = (
-                service_client.table("project_group_members")
-                .select("user_id", count="exact")
-                .eq("group_id", group["id"])
-                .execute()
-            )
-            group_rows.append({
-                "Group": group.get("group_name"),
-                "Project": (project_by_id.get(group.get("project_id")) or {}).get(
-                    "project_name", group.get("project_id")
-                ),
-                "Members": members.count or 0,
-                "Description": group.get("description") or "",
-                "Email scope": "Planned",
-            })
-        st.dataframe(pd.DataFrame(group_rows), use_container_width=True, hide_index=True)
-
-    result = service_client.table("user_profiles").select("*").order("created_at", desc=True).execute()
-    profiles = result.data or []
-    if not profiles:
-        st.caption("No registered account profiles yet.")
-        return
-
-    group_label_to_id = {
-        f"{g.get('group_name')} · {(project_by_id.get(g.get('project_id')) or {}).get('project_name', 'Unknown project')}": g["id"]
-        for g in groups
-    }
-
-    st.markdown("#### Find a user")
-    st.caption("Click the dropdown and type any part of the person's name or email address.")
-
-    # Keep user IDs as stable option values. Streamlit's selectbox supports type-to-search,
-    # while format_func displays a useful name/email label.
-    profile_by_id = {str(profile["id"]): profile for profile in profiles}
-    ordered_user_ids = sorted(
-        profile_by_id,
-        key=lambda uid: (
-            str(profile_by_id[uid].get("approval_status") or "pending") != "pending",
-            str(profile_by_id[uid].get("full_name") or "").casefold(),
-            str(profile_by_id[uid].get("email") or "").casefold(),
-        ),
-    )
-
-    def _user_option_label(user_id):
-        profile = profile_by_id[user_id]
-        name = str(profile.get("full_name") or "Unnamed user").strip()
-        email = str(profile.get("email") or user_id).strip()
-        role = str(profile.get("role") or "viewer").title()
-        status = str(profile.get("approval_status") or "pending").title()
-        return f"{name} — {email} · {role} · {status}"
-
-    selected_user_id = st.selectbox(
-        "Search name or email",
-        ordered_user_ids,
-        format_func=_user_option_label,
-        key="user_management_selected_user",
-        placeholder="Choose or type to search for a user",
-    )
-    profile = profile_by_id.get(str(selected_user_id))
-    if not profile:
-        st.info("Select an account to manage its access.")
-        return
-
-    user_id = str(profile["id"])
-    with st.container(border=True):
-        top1, top2, top3 = st.columns([3, 1, 1])
-        top1.markdown(f"### {profile.get('full_name') or 'Unnamed user'}")
-        top1.markdown(f"[{profile.get('email') or user_id}](mailto:{profile.get('email') or ''})")
-        top2.metric("Current role", str(profile.get("role") or "viewer").title())
-        top3.metric("Status", str(profile.get("approval_status") or "pending").title())
-        st.caption(f"Account created: {str(profile.get('created_at') or '')[:10]}")
-
-        c1, c2, c3 = st.columns(3)
-        role_options = ["viewer", "editor", "admin"]
-        current_role = profile.get("role") if profile.get("role") in role_options else "viewer"
-        new_role = c1.selectbox(
-            "Role",
-            role_options,
-            index=role_options.index(current_role),
-            key=f"profile_role_{user_id}",
-        )
-        status_options = ["pending", "approved", "rejected"]
-        current_status = (
-            profile.get("approval_status")
-            if profile.get("approval_status") in status_options
-            else "pending"
-        )
-        new_status = c2.selectbox(
-            "Status",
-            status_options,
-            index=status_options.index(current_status),
-            key=f"profile_status_{user_id}",
-        )
-        active = c3.checkbox(
-            "Account active",
-            value=bool(profile.get("is_active", True)),
-            key=f"profile_active_{user_id}",
-        )
-
-        current_direct = _direct_project_ids(service_client, user_id)
-        current_project_labels = [
-            label for label, pid in project_label_to_id.items() if pid in current_direct
-        ]
-        selected_project_labels = st.multiselect(
-            "Direct project access",
-            list(project_label_to_id.keys()),
-            default=current_project_labels,
-            key=f"profile_projects_{user_id}",
-            help="A user can access several projects. Group access is added on top of these selections.",
-        )
-
-        current_groups = _user_group_ids(service_client, user_id)
-        current_group_labels = [
-            label for label, gid in group_label_to_id.items() if gid in current_groups
-        ]
-        selected_group_labels = st.multiselect(
-            "Project groups",
-            list(group_label_to_id.keys()),
-            default=current_group_labels,
-            key=f"profile_groups_{user_id}",
-            help="Membership grants access to the project linked to each group.",
-        )
-
-        # Show the effective project list before the admin saves anything.
-        direct_project_ids = {project_label_to_id[label] for label in selected_project_labels}
-        selected_group_ids = {group_label_to_id[label] for label in selected_group_labels}
-        grouped_project_ids = {
-            group.get("project_id") for group in groups if group.get("id") in selected_group_ids
-        }
-        effective_project_ids = direct_project_ids | grouped_project_ids
-        effective_names = [
-            (project_by_id.get(pid) or {}).get("project_name", f"Project #{pid}")
-            for pid in sorted(effective_project_ids)
-        ]
-        st.info(
-            "Effective project access: "
-            + (", ".join(effective_names) if effective_names else "No projects assigned")
-        )
-
-        credentials_label = (
-            "Confirm master key"
-            if ACCESS_CONTEXT.get("mode") == "master"
-            else "Confirm your admin password"
-        )
-        safety_secret = st.text_input(
-            credentials_label,
-            type="password",
-            key=f"profile_safety_{user_id}",
-            help=(
-                "Fresh credentials are required before role, approval, active-state, "
-                "project or group access changes are applied."
-            ),
-        )
-
-        save_col, reset_col = st.columns([1, 5])
-        if save_col.button("Save user access", key=f"save_profile_{user_id}", type="primary"):
-            if not _verify_admin_safety_check(ACCESS_CONTEXT, safety_secret):
-                st.error("Safety check failed. Enter your current admin password or master key.")
-                return
-
-            service_client.table("user_profiles").update({
-                "role": new_role,
-                "approval_status": new_status,
-                "is_active": active,
-                "approved_at": (
-                    datetime.now(timezone.utc).isoformat() if new_status == "approved" else None
-                ),
-                "approved_by": CURRENT_ACTOR,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("id", user_id).execute()
-
-            desired_projects = {
-                project_label_to_id[label] for label in selected_project_labels
-            }
-            service_client.table("user_project_access").delete().eq("user_id", user_id).execute()
-            if desired_projects:
-                service_client.table("user_project_access").insert([
-                    {"user_id": user_id, "project_id": pid, "granted_by": CURRENT_ACTOR}
-                    for pid in sorted(desired_projects)
-                ]).execute()
-
-            desired_groups = {group_label_to_id[label] for label in selected_group_labels}
-            service_client.table("project_group_members").delete().eq("user_id", user_id).execute()
-            if desired_groups:
-                service_client.table("project_group_members").insert([
-                    {"user_id": user_id, "group_id": gid, "added_by": CURRENT_ACTOR}
-                    for gid in sorted(desired_groups)
-                ]).execute()
-
-            service_client.table("app_sessions").update({
-                "revoked_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("user_id", user_id).is_("revoked_at", "null").execute()
-            st.success("User access updated. Existing remembered sessions were revoked.")
-            st.rerun()
-
-        if reset_col.button("Reload saved access", key=f"reload_profile_{user_id}"):
-            # Clear this user's widget state so values are reconstructed from Supabase.
-            for prefix in (
-                "profile_role_", "profile_status_", "profile_active_",
-                "profile_projects_", "profile_groups_", "profile_safety_",
-            ):
-                st.session_state.pop(f"{prefix}{user_id}", None)
-            st.rerun()
 
 
 # ----------------------------------------------------------------------------
@@ -1551,19 +861,14 @@ def list_imports(supabase, project_id=None):
     return res.data or []
 
 
-def list_projects(supabase, access_context=None):
-    query = (
+def list_projects(supabase):
+    res = (
         supabase.table("projects")
         .select("*")
         .eq("is_active", True)
+        .order("created_at", desc=True)
+        .execute()
     )
-    if access_context is not None:
-        allowed = accessible_project_ids(supabase, access_context)
-        if allowed is not None:
-            if not allowed:
-                return []
-            query = query.in_("id", sorted(allowed))
-    res = query.order("created_at", desc=True).execute()
     return res.data or []
 
 
@@ -1585,8 +890,6 @@ def list_templates(supabase):
 
 def create_template(supabase, *, name, file_bytes, filename, description=""):
     """Validate, store, and register a reusable DCI template."""
-    if not globals().get("CAN_ADMIN", False):
-        raise PermissionError("Admin access is required to create templates.")
     _ws, layout, diagnostics = inspect_workbook_bytes(file_bytes)
     template_row = {
         "template_name": str(name).strip() or filename,
@@ -1621,8 +924,6 @@ def create_template(supabase, *, name, file_bytes, filename, description=""):
 
 
 def create_project(supabase, *, project_name, contractor, client, review_period_days, template_id):
-    if not globals().get("CAN_ADMIN", False):
-        raise PermissionError("Admin access is required to create projects.")
     row = {
         "project_name": str(project_name).strip(),
         "contractor": str(contractor or "").strip() or None,
@@ -1661,8 +962,6 @@ def upload_workbook_to_storage(supabase, import_id, file_bytes, filename):
 def run_import(supabase, file_bytes, filename, project_name, contractor,
                 review_period_days, version_mode, parent_import_id=None,
                 project_id=None, template_id=None):
-    if not globals().get("CAN_ADMIN", False):
-        raise PermissionError("Admin access is required to import workbooks.")
     """Import a workbook without deactivating the current version prematurely.
 
     Supabase/PostgREST calls are not a single database transaction from Python, so
@@ -1957,8 +1256,6 @@ def build_change_diff(form_values, current_record):
 
 def save_document_changes(supabase, document_id, form_values, current_record, changed_by, event_type):
     """Persist changed fields atomically through the database RPC."""
-    if not globals().get("CAN_EDIT", False):
-        raise PermissionError("Editor access is required to update documents.")
     record_diff = build_change_diff(form_values, current_record)
     if not record_diff:
         return False, []
@@ -2105,8 +1402,6 @@ def _find_revision_block(ws, row_number, revision, revision_blocks):
 
 
 def generate_updated_workbook(supabase, import_id):
-    if not globals().get("CAN_EXPORT", False):
-        raise PermissionError("An approved Viewer, Editor, Admin, or Master account is required to export workbooks.")
     import openpyxl
 
     meta = get_import_meta(supabase, import_id)
@@ -2227,11 +1522,11 @@ def generate_updated_workbook(supabase, import_id):
     return buf.getvalue(), filename
 
 
-def record_export(supabase, import_id, export_type, filename, row_count, exported_by=None):
+def record_export(supabase, import_id, export_type, filename, row_count, exported_by="dashboard-user"):
     supabase.table("export_records").insert({
         "import_id": import_id,
         "export_type": export_type,
-        "exported_by": exported_by or globals().get("CURRENT_ACTOR", "authenticated-user"),
+        "exported_by": exported_by,
         "filename": filename,
         "row_count": row_count,
         "success": True,
@@ -2646,13 +1941,6 @@ if supabase is None:
     )
     st.stop()
 
-# Authenticate before any project data or server-side write controls are rendered.
-ACCESS_CONTEXT = render_auth_gate(supabase)
-CAN_EDIT = _can_edit(ACCESS_CONTEXT)
-CAN_ADMIN = _can_admin(ACCESS_CONTEXT)
-CAN_EXPORT = _can_export(ACCESS_CONTEXT)
-CURRENT_ACTOR = _actor_label(ACCESS_CONTEXT)
-
 # ----------------------------------------------------------------------------
 # PROJECT HOME / PROJECT SELECTION
 # ----------------------------------------------------------------------------
@@ -2667,13 +1955,8 @@ def _clear_pending_upload():
 def render_project_home(supabase):
     st.title("DCI Project Home")
     st.caption("Open an existing project or create a new one from a reusable Excel template.")
-    st.caption(f"Signed in as **{ACCESS_CONTEXT.get('name')}** · Role: **{ACCESS_CONTEXT.get('role').title()}**")
 
-    if CAN_ADMIN:
-        with st.expander("👥 User Access Management", expanded=False):
-            render_user_management(supabase)
-
-    projects = list_projects(supabase, ACCESS_CONTEXT)
+    projects = list_projects(supabase)
     if projects:
         st.subheader("Projects")
         cards_per_row = 3
@@ -2703,15 +1986,9 @@ def render_project_home(supabase):
                         _clear_pending_upload()
                         st.rerun()
     else:
-        if CAN_ADMIN:
-            st.info("No projects exist yet. Create the first project below.")
-        else:
-            st.warning("Your account is approved, but no project has been assigned to you yet. Contact an administrator.")
+        st.info("No projects exist yet. Create the first project below.")
 
     st.markdown("---")
-    if not CAN_ADMIN:
-        st.info("Only an Admin or Master user can create a new project.")
-        return
     st.subheader("＋ Create New Project")
     with st.container(border=True):
         project_name = st.text_input("Project name *", key="new_project_name")
@@ -2795,7 +2072,7 @@ def render_project_home(supabase):
 
 
 try:
-    _available_projects = list_projects(supabase, ACCESS_CONTEXT)
+    _available_projects = list_projects(supabase)
 except Exception as exc:
     st.error("The multi-project database migration has not been applied yet.")
     st.code(str(exc))
@@ -2818,27 +2095,11 @@ if not active_project:
     st.session_state.pop("active_project_id", None)
     st.session_state["show_project_home"] = True
     st.rerun()
-_allowed_project_ids = accessible_project_ids(supabase, ACCESS_CONTEXT)
-if _allowed_project_ids is not None and active_project_id not in _allowed_project_ids:
-    st.session_state.pop("active_project_id", None)
-    st.session_state["show_project_home"] = True
-    st.error("You no longer have access to that project.")
-    st.rerun()
 
 # ----------------------------------------------------------------------------
 # SIDEBAR
 # ----------------------------------------------------------------------------
 st.sidebar.title("DCI Dashboard")
-st.sidebar.caption(f"{ACCESS_CONTEXT.get('name')} · {ACCESS_CONTEXT.get('role').title()}")
-if st.sidebar.button("Sign out", use_container_width=True):
-    try:
-        auth_client = get_auth_supabase()
-        if auth_client and ACCESS_CONTEXT.get("mode") == "account":
-            auth_client.auth.sign_out()
-    except Exception:
-        pass
-    _clear_access_session(supabase)
-    st.rerun()
 if st.sidebar.button("← Project Home", use_container_width=True):
     st.session_state["show_project_home"] = True
     _clear_pending_upload()
@@ -2863,14 +2124,11 @@ with st.sidebar.expander("Workbook", expanded=True):
         active_import = None
         st.info("No workbook imported yet. Upload one in the **Import / Export** tab.")
 
-    if CAN_ADMIN:
-        new_upload = st.file_uploader("Upload a new DCI workbook (.xlsx)", type=["xlsx"], key="sidebar_uploader")
-        if new_upload is not None:
-            st.session_state["pending_upload_bytes"] = new_upload.getvalue()
-            st.session_state["pending_upload_name"] = new_upload.name
-            st.info("Go to the **Import / Export** tab to validate and confirm this upload.")
-    else:
-        st.caption("Workbook import is available to Admin and Master users only.")
+    new_upload = st.file_uploader("Upload a new DCI workbook (.xlsx)", type=["xlsx"], key="sidebar_uploader")
+    if new_upload is not None:
+        st.session_state["pending_upload_bytes"] = new_upload.getvalue()
+        st.session_state["pending_upload_name"] = new_upload.name
+        st.info("Go to the **Import / Export** tab to validate and confirm this upload.")
 
 st.sidebar.markdown("---")
 with st.sidebar.expander("Project Settings", expanded=True):
@@ -2946,6 +2204,7 @@ if has_data:
         include_undated = st.sidebar.checkbox("Include documents without an uploaded date", value=True)
 
 filtered = df.copy()
+filtered_without_revision = df.copy()
 if has_data:
     if f_discipline:
         filtered = filtered[filtered["discipline"].isin(f_discipline)]
@@ -2971,13 +2230,12 @@ if has_data:
         filtered = filtered[date_match]
 
     # Keep a copy with every active filter except Revision. The Delays & Aging
-    # tab uses this to draw one independent chart per selected revision instead
-    # of merging the selected revisions into one cumulative chart.
-    revision_comparison_base = filtered.copy()
+    # tab uses this to render one independent chart per selected revision instead
+    # of combining all selected revisions into a single chart.
+    filtered_without_revision = filtered.copy()
+
     if f_revision:
         filtered = filtered[filtered["latest_rev_display"].isin(f_revision)]
-else:
-    revision_comparison_base = filtered.copy()
 
 filtered_doc_numbers = set(filtered["doc_no"]) if has_data else set()
 filtered_hist = hist[hist["doc_no"].isin(filtered_doc_numbers)].copy() if has_data else hist
@@ -3304,168 +2562,253 @@ try:
             open_docs = filtered[~filtered["is_approved_final"] & ~filtered["is_void"]]
             st.subheader("Aging Buckets (open documents)")
 
-            show_not_due_yet = st.checkbox(
-                "Show Not Due Yet",
+            show_not_due = st.checkbox(
+                "Show 'Not due yet'",
                 value=True,
-                key="show_not_due_yet_aging_charts",
-                help="Show or hide the Not due yet bucket in every aging chart.",
+                key="show_not_due_aging_charts",
+                help="Applies to every revision chart shown below.",
             )
 
-            displayed_bucket_order = [
-                bucket for bucket in AGING_BUCKET_ORDER
-                if show_not_due_yet or bucket != "Not due yet"
-            ]
-            aging_bucket_colors = {
-                "Not due yet": "#94A3B8",
-                "0-7 days": "#EF4444",
-                "8-14 days": "#3B82F6",
-                "15-21 days": "#F59E0B",
-                ">21 days": "#7C3AED",
+            bucket_order = (
+                AGING_BUCKET_ORDER
+                if show_not_due
+                else [bucket for bucket in AGING_BUCKET_ORDER if bucket != "Not due yet"]
+            )
+            bucket_colors = {
+                "Not due yet": "#B8C2CC",
+                "0-7 days": "#E74C3C",
+                "8-14 days": "#3498DB",
+                "15-21 days": "#F39C12",
+                ">21 days": "#8E44AD",
             }
 
-            # Every selected revision gets its own chart. All other sidebar filters
-            # remain active, but revisions are never combined into one bar chart.
             if f_revision:
-                aging_chart_groups = [
-                    (str(revision), revision_comparison_base[
-                        revision_comparison_base["latest_rev_display"] == revision
-                    ])
-                    for revision in f_revision
-                ]
+                chart_specs = []
+                for revision in f_revision:
+                    revision_docs = filtered_without_revision[
+                        filtered_without_revision["latest_rev_display"] == revision
+                    ]
+                    revision_open = revision_docs[
+                        ~revision_docs["is_approved_final"] & ~revision_docs["is_void"]
+                    ]
+                    counts = (
+                        revision_open["aging_bucket"]
+                        .value_counts()
+                        .reindex(bucket_order, fill_value=0)
+                        .reset_index()
+                    )
+                    counts.columns = ["Aging Bucket", "Count"]
+                    chart_specs.append((revision, revision_open, counts))
             else:
-                aging_chart_groups = [("All revisions", revision_comparison_base)]
-
-            prepared_charts = []
-            shared_y_max = 0
-            for revision_label, revision_df in aging_chart_groups:
-                revision_open_docs = revision_df[
-                    ~revision_df["is_approved_final"] & ~revision_df["is_void"]
-                ]
                 counts = (
-                    revision_open_docs["aging_bucket"]
+                    open_docs["aging_bucket"]
                     .value_counts()
-                    .reindex(displayed_bucket_order)
-                    .fillna(0)
-                    .astype(int)
+                    .reindex(bucket_order, fill_value=0)
                     .reset_index()
                 )
                 counts.columns = ["Aging Bucket", "Count"]
-                shared_y_max = max(
-                    shared_y_max,
-                    int(counts["Count"].max()) if not counts.empty else 0,
-                )
-                prepared_charts.append((revision_label, revision_open_docs, counts))
+                chart_specs = [("All revisions", open_docs, counts)]
 
-            # A common y-axis keeps the visual comparison honest.
-            shared_y_upper = max(1, int(shared_y_max * 1.18) + 1)
+            shared_y_max = max(
+                [int(spec[2]["Count"].max()) if not spec[2].empty else 0 for spec in chart_specs]
+                + [1]
+            )
+            shared_y_max = max(1, int(shared_y_max * 1.18))
 
-            import html as _html
-            import plotly.io as pio
-
-            chart_cards = []
-            for chart_index, (revision_label, revision_open_docs, counts) in enumerate(prepared_charts):
+            def build_aging_figure(bucket_counts):
                 fig = px.bar(
-                    counts,
+                    bucket_counts,
                     x="Aging Bucket",
                     y="Count",
                     text="Count",
-                    category_orders={"Aging Bucket": displayed_bucket_order},
+                    color="Aging Bucket",
+                    category_orders={"Aging Bucket": bucket_order},
+                    color_discrete_map=bucket_colors,
                 )
                 fig.update_traces(
-                    marker_color=[aging_bucket_colors[b] for b in counts["Aging Bucket"]],
                     textposition="outside",
                     cliponaxis=False,
-                    hovertemplate="%{x}<br>Documents: %{y}<extra></extra>",
+                    marker_line_width=0,
+                    width=0.34,
+                    hovertemplate="<b>%{x}</b><br>Documents: %{y}<extra></extra>",
                 )
                 fig.update_layout(
-                    height=360,
-                    margin=dict(l=38, r=20, t=18, b=70),
+                    height=330,
                     showlegend=False,
+                    bargap=0.66,
+                    margin=dict(l=42, r=18, t=18, b=66),
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)",
-                    bargap=0.32,
+                    xaxis_title=None,
+                    yaxis_title="Count",
                     yaxis=dict(
-                        title="Documents",
-                        range=[0, shared_y_upper],
-                        gridcolor="rgba(148,163,184,0.22)",
+                        range=[0, shared_y_max],
+                        gridcolor="rgba(120,120,120,0.16)",
                         zeroline=False,
+                        tickfont=dict(size=10),
                         fixedrange=True,
                     ),
-                    xaxis=dict(title="", fixedrange=True),
-                    font=dict(size=12),
+                    xaxis=dict(
+                        tickfont=dict(size=10),
+                        tickangle=-18,
+                        fixedrange=True,
+                        automargin=True,
+                    ),
+                    hoverlabel=dict(namelength=-1),
                 )
-                chart_html = pio.to_html(
-                    fig,
-                    full_html=False,
-                    include_plotlyjs=True if chart_index == 0 else False,
-                    config={"displayModeBar": False, "responsive": True},
-                )
-                safe_label = _html.escape(revision_label)
-                chart_cards.append(
-                    f"""
-                    <section class="aging-chart-card">
-                        <div class="aging-chart-heading">
-                            <div>Revision: <strong>{safe_label}</strong></div>
-                            <span>{len(revision_open_docs):,} open documents</span>
-                        </div>
-                        {chart_html}
-                    </section>
-                    """
+                return fig
+
+            # Up to two charts can comfortably share the available page width.
+            # From the third chart onward, preserve a readable minimum card width
+            # and allow horizontal scrolling instead of squeezing the charts.
+            if len(chart_specs) <= 2:
+                chart_columns = st.columns(
+                    len(chart_specs),
+                    gap="small",
+                    vertical_alignment="top",
                 )
 
-            comparison_hint = (
-                "Scroll horizontally to compare every selected revision."
-                if len(chart_cards) > 2
-                else "Each selected revision is displayed independently."
-            )
-            components.html(
-                f"""
+                for column, (revision, revision_open, bucket_counts) in zip(chart_columns, chart_specs):
+                    with column:
+                        with st.container(border=True):
+                            title = (
+                                f"Revision {revision}"
+                                if revision != "All revisions"
+                                else "All revisions"
+                            )
+                            st.markdown(f"#### {title}")
+                            st.caption(
+                                f"{len(revision_open)} open document"
+                                f"{'s' if len(revision_open) != 1 else ''}"
+                            )
+                            st.plotly_chart(
+                                build_aging_figure(bucket_counts),
+                                use_container_width=True,
+                                config={
+                                    "displayModeBar": False,
+                                    "responsive": True,
+                                },
+                                key=f"aging_revision_chart_{revision}",
+                            )
+            else:
+                import html
+                import streamlit.components.v1 as components
+
+                card_html = []
+                for index, (revision, revision_open, bucket_counts) in enumerate(chart_specs):
+                    title = (
+                        f"Revision {revision}"
+                        if revision != "All revisions"
+                        else "All revisions"
+                    )
+                    figure_html = build_aging_figure(bucket_counts).to_html(
+                        full_html=False,
+                        include_plotlyjs="cdn" if index == 0 else False,
+                        config={
+                            "displayModeBar": False,
+                            "responsive": True,
+                        },
+                    )
+                    document_word = "document" if len(revision_open) == 1 else "documents"
+                    card_html.append(
+                        f"""
+                        <section class="aging-card">
+                            <h3>{html.escape(title)}</h3>
+                            <p>{len(revision_open)} open {document_word}</p>
+                            <div class="aging-figure">{figure_html}</div>
+                        </section>
+                        """
+                    )
+
+                scrolling_html = f"""
                 <style>
-                    * {{ box-sizing: border-box; }}
-                    body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-                    .aging-comparison-note {{
-                        margin: 0 0 8px 2px; color: #64748B; font-size: 13px;
+                    * {{
+                        box-sizing: border-box;
                     }}
-                    .aging-chart-strip {{
-                        display: flex; flex-wrap: nowrap; gap: 16px; overflow-x: auto;
-                        padding: 4px 4px 14px; scroll-behavior: smooth;
-                        scrollbar-width: thin; scrollbar-color: #94A3B8 transparent;
+                    html, body {{
+                        margin: 0;
+                        padding: 0;
+                        background: transparent;
+                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                                     Roboto, Helvetica, Arial, sans-serif;
+                    }}
+                    .aging-strip {{
+                        display: flex;
+                        flex-wrap: nowrap;
+                        gap: 16px;
+                        width: 100%;
+                        overflow-x: auto;
+                        overflow-y: hidden;
+                        padding: 2px 2px 15px;
                         scroll-snap-type: x proximity;
+                        scrollbar-width: thin;
+                        scrollbar-color: rgba(110, 118, 129, 0.55)
+                                         rgba(110, 118, 129, 0.12);
+                        -webkit-overflow-scrolling: touch;
                     }}
-                    .aging-chart-strip::-webkit-scrollbar {{ height: 9px; }}
-                    .aging-chart-strip::-webkit-scrollbar-thumb {{
-                        background: #94A3B8; border-radius: 999px;
+                    .aging-strip::-webkit-scrollbar {{
+                        height: 10px;
                     }}
-                    .aging-chart-card {{
-                        flex: 1 0 min(520px, calc(100vw - 28px));
-                        min-width: min(520px, calc(100vw - 28px));
-                        max-width: 620px; background: #FFFFFF;
-                        border: 1px solid #E2E8F0; border-radius: 14px;
-                        padding: 14px 14px 2px; box-shadow: 0 3px 12px rgba(15,23,42,0.07);
+                    .aging-strip::-webkit-scrollbar-track {{
+                        background: rgba(110, 118, 129, 0.12);
+                        border-radius: 999px;
+                    }}
+                    .aging-strip::-webkit-scrollbar-thumb {{
+                        background: rgba(110, 118, 129, 0.55);
+                        border-radius: 999px;
+                    }}
+                    .aging-card {{
+                        flex: 0 0 430px;
+                        min-width: 430px;
+                        max-width: 430px;
+                        min-height: 430px;
+                        padding: 20px 18px 10px;
+                        border: 1px solid rgba(110, 118, 129, 0.32);
+                        border-radius: 14px;
+                        background: rgba(255, 255, 255, 0.98);
+                        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
                         scroll-snap-align: start;
                     }}
-                    .aging-chart-heading {{
-                        display: flex; justify-content: space-between; align-items: center; gap: 12px;
-                        color: #0F172A; font-size: 17px; padding: 2px 4px 0;
+                    .aging-card h3 {{
+                        margin: 0;
+                        color: #2f3542;
+                        font-size: 25px;
+                        line-height: 1.25;
                     }}
-                    .aging-chart-heading span {{
-                        color: #475569; font-size: 12px; white-space: nowrap;
-                        background: #F1F5F9; border-radius: 999px; padding: 5px 9px;
+                    .aging-card p {{
+                        margin: 10px 0 2px;
+                        color: #747d8c;
+                        font-size: 16px;
                     }}
-                    @media (max-width: 640px) {{
-                        .aging-chart-card {{
-                            flex-basis: calc(100vw - 24px);
-                            min-width: calc(100vw - 24px);
+                    .aging-figure {{
+                        width: 100%;
+                        min-width: 0;
+                    }}
+                    .aging-figure .plotly-graph-div {{
+                        width: 100% !important;
+                    }}
+                    @media (max-width: 600px) {{
+                        .aging-card {{
+                            flex-basis: 88vw;
+                            min-width: 88vw;
+                            max-width: 88vw;
                         }}
-                        .aging-chart-heading {{ align-items: flex-start; flex-direction: column; gap: 5px; }}
                     }}
                 </style>
-                <div class="aging-comparison-note">{comparison_hint}</div>
-                <div class="aging-chart-strip">{''.join(chart_cards)}</div>
-                """,
-                height=455,
-                scrolling=False,
-            )
+                <div class="aging-strip">
+                    {''.join(card_html)}
+                </div>
+                """
+
+                components.html(
+                    scrolling_html,
+                    height=485,
+                    scrolling=False,
+                )
+                st.caption(
+                    "Scroll horizontally to compare revisions. "
+                    "Each chart keeps the same readable width and y-axis scale."
+                )
 
             m = st.columns(3)
             m[0].metric("Total open (pending) documents", len(open_docs))
@@ -3565,8 +2908,6 @@ try:
             st.info("No workbook imported yet.")
         else:
             st.subheader("Update Document")
-            if not CAN_EDIT:
-                st.warning("Your Viewer role is read-only. An Editor, Admin, or Master user can save document updates.")
             selector_options = build_document_selector_options(df)
             option_labels = [label for label, _ in selector_options]
             id_by_label = dict(selector_options)
@@ -3630,12 +2971,12 @@ try:
                     new_revision = st.selectbox(
                         "Revision", revision_choices,
                         index=revision_choices.index(current_revision) if current_revision in revision_choices else 0,
-                        key=f"revision_{document_id}", disabled=not CAN_EDIT,
+                        key=f"revision_{document_id}",
                     )
                     new_code = st.selectbox(
                         "Return Code", code_choices,
                         index=code_choices.index(current_code) if current_code in code_choices else 0,
-                        key=f"return_code_{document_id}", disabled=not CAN_EDIT,
+                        key=f"return_code_{document_id}",
                     )
                     derived_status = CODE_TO_DCI_STATUS.get(new_code, "UNMAPPED")
                     st.text_input("DCI Status (automatic)", value=derived_status, disabled=True,
@@ -3643,11 +2984,11 @@ try:
                 with right:
                     revision_date = st.date_input(
                         "Revision Date", value=_safe_date(doc_row["latest_uploaded_date"]),
-                        key=f"revision_date_{document_id}", disabled=not CAN_EDIT,
+                        key=f"revision_date_{document_id}",
                     )
                     return_date = st.date_input(
                         "Return Date", value=_safe_date(doc_row["latest_from_eil_date"]),
-                        key=f"return_date_{document_id}", disabled=not CAN_EDIT,
+                        key=f"return_date_{document_id}",
                     )
 
                 validation_errors = []
@@ -3678,10 +3019,10 @@ try:
                     st.caption("No additional comments have been added.")
                 new_comment = st.text_area(
                     "Add Comment", placeholder="Enter an optional comment for this revision update…",
-                    key=f"new_comment_{document_id}", disabled=not CAN_EDIT,
+                    key=f"new_comment_{document_id}",
                 )
 
-                if st.button("Save Revision Update", type="primary", disabled=bool(validation_errors) or not CAN_EDIT,
+                if st.button("Save Revision Update", type="primary", disabled=bool(validation_errors),
                              key=f"save_revision_{document_id}"):
                     remarks_value = existing_remarks
                     clean_comment = new_comment.strip() if new_comment else ""
@@ -3701,7 +3042,7 @@ try:
 
                     changed, diff = save_document_changes(
                         supabase, document_id, form_values, doc_row.to_dict(),
-                        changed_by=CURRENT_ACTOR, event_type="revision_updated",
+                        changed_by="dashboard-user", event_type="revision_updated",
                     )
                     if changed:
                         st.success(f"Saved {len(diff)} change(s) to {doc_row['doc_no']}.")
@@ -3710,9 +3051,34 @@ try:
                         st.info("No changes were detected.")
 
                 st.markdown("---")
-                if CAN_ADMIN:
-                    with st.expander("⚙ Admin Configuration", expanded=False):
-                        st.caption("Admin/master users can manage revision, code, discipline, and vendor master data.")
+                with st.expander("⚙ Admin Configuration", expanded=False):
+                    st.caption(
+                        "The password protects master-data configuration only. Normal document updates remain available without it."
+                    )
+                    admin_password = get_admin_password()
+                    unlock_key = "master_data_configuration_unlocked"
+
+                    if not admin_password_configured():
+                        st.error(
+                            "ADMIN_PASSWORD is not configured. Add it to `.streamlit/secrets.toml` "
+                            "or the ADMIN_PASSWORD environment variable, then restart the app."
+                        )
+                    elif not st.session_state.get(unlock_key, False):
+                        entered_password = st.text_input("Admin password", type="password",
+                                                         key="master_data_configuration_password")
+                        if st.button("Unlock Configuration", key="unlock_master_data_configuration"):
+                            if hmac.compare_digest(entered_password, admin_password):
+                                st.session_state[unlock_key] = True
+                                st.rerun()
+                            else:
+                                st.error("Incorrect password.")
+                    else:
+                        top1, top2 = st.columns([4, 1])
+                        top1.success("Configuration is unlocked.")
+                        if top2.button("Lock", key="lock_master_data_configuration"):
+                            st.session_state[unlock_key] = False
+                            st.rerun()
+
                         c1, c2 = st.columns(2)
                         with c1:
                             st.markdown("##### Revision options")
@@ -3786,6 +3152,7 @@ try:
                                 st.rerun()
                             except Exception as exc:
                                 st.error("Could not reset configuration: " + str(exc))
+
     # TAB 11: DOCUMENT TIMELINE
     # ------------------------------------------------------------------
     with tabs[10]:
@@ -3869,131 +3236,128 @@ try:
     # TAB 12: IMPORT / EXPORT
     # ------------------------------------------------------------------
     with tabs[11]:
-        if not CAN_ADMIN:
-            st.info("Import is restricted to Admin and Master users. Export is available below.")
-        else:
-            st.subheader("Import")
+        st.subheader("Import")
 
-            pending_bytes = st.session_state.get("pending_upload_bytes")
-            pending_name = st.session_state.get("pending_upload_name")
+        pending_bytes = st.session_state.get("pending_upload_bytes")
+        pending_name = st.session_state.get("pending_upload_name")
 
-            tab_upload = st.file_uploader("Upload a DCI workbook (.xlsx)", type=["xlsx"], key="import_tab_uploader")
-            if tab_upload is not None:
-                pending_bytes = tab_upload.getvalue()
-                pending_name = tab_upload.name
-                st.session_state["pending_upload_bytes"] = pending_bytes
-                st.session_state["pending_upload_name"] = pending_name
+        tab_upload = st.file_uploader("Upload a DCI workbook (.xlsx)", type=["xlsx"], key="import_tab_uploader")
+        if tab_upload is not None:
+            pending_bytes = tab_upload.getvalue()
+            pending_name = tab_upload.name
+            st.session_state["pending_upload_bytes"] = pending_bytes
+            st.session_state["pending_upload_name"] = pending_name
 
-            if pending_bytes is None:
-                st.caption("No pending workbook. Upload a populated workbook above when project documents are ready.")
-                if active_project.get("template_id"):
-                    try:
-                        template_bytes, template_meta = get_template_bytes(supabase, active_project["template_id"])
-                        st.download_button(
-                            "Download Project Template",
-                            data=template_bytes,
-                            file_name=template_meta.get("original_filename") or "DCI_Template.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
-                    except Exception as template_exc:
-                        st.warning(f"The project template could not be loaded: {template_exc}")
-            else:
+        if pending_bytes is None:
+            st.caption("No pending workbook. Upload a populated workbook above when project documents are ready.")
+            if active_project.get("template_id"):
                 try:
-                    _preview_ws, discovered_layout, discovery_info = inspect_workbook_bytes(pending_bytes)
-                    records, history, wb_project, wb_contractor = parse_workbook_bytes(pending_bytes)
-                    warnings, errors = validate_records(records)
-                    file_hash = workbook_hash(pending_bytes)
-                    dup = find_import_by_hash(supabase, file_hash, active_project_id)
+                    template_bytes, template_meta = get_template_bytes(supabase, active_project["template_id"])
+                    st.download_button(
+                        "Download Project Template",
+                        data=template_bytes,
+                        file_name=template_meta.get("original_filename") or "DCI_Template.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                except Exception as template_exc:
+                    st.warning(f"The project template could not be loaded: {template_exc}")
+        else:
+            try:
+                _preview_ws, discovered_layout, discovery_info = inspect_workbook_bytes(pending_bytes)
+                records, history, wb_project, wb_contractor = parse_workbook_bytes(pending_bytes)
+                warnings, errors = validate_records(records)
+                file_hash = workbook_hash(pending_bytes)
+                dup = find_import_by_hash(supabase, file_hash, active_project_id)
 
-                    st.markdown("#### Preview")
-                    p1, p2, p3 = st.columns(3)
-                    p1.metric("Filename", pending_name)
-                    p2.metric("Rows Found", len(records))
-                    p3.metric("Warnings", len(warnings))
+                st.markdown("#### Preview")
+                p1, p2, p3 = st.columns(3)
+                p1.metric("Filename", pending_name)
+                p2.metric("Rows Found", len(records))
+                p3.metric("Warnings", len(warnings))
 
-                    with st.expander("Detected workbook structure", expanded=False):
-                        d1, d2, d3 = st.columns(3)
-                        d1.metric("Worksheet", discovery_info["sheet"])
-                        d2.metric("Header row", discovery_info["header_row"])
-                        d3.metric("Revision blocks", len(discovery_info["revision_blocks"]))
-                        st.caption(
-                            f"First data row: {discovery_info['data_start_row']} · "
-                            f"Template engine: v{discovered_layout.get('engine_version', TEMPLATE_ENGINE_VERSION)}"
-                        )
-                        field_rows = [
-                            {"Logical field": field.replace("_", " ").title(), "Detected column": column}
-                            for field, column in discovery_info["fields"].items()
-                        ]
-                        if field_rows:
-                            st.dataframe(pd.DataFrame(field_rows), use_container_width=True, hide_index=True)
-                        if discovery_info["revision_blocks"]:
-                            st.dataframe(
-                                pd.DataFrame(discovery_info["revision_blocks"]),
-                                use_container_width=True,
-                                hide_index=True,
-                            )
-
-                    if errors:
-                        for e in errors:
-                            st.error(e)
-                    if warnings:
-                        for w in warnings:
-                            st.warning(w)
-
-                    preview_df = pd.DataFrame(records[:10])
-                    cols_to_show = [c for c in ["doc_no", "title", "discipline", "status", "latest_rev", "latest_code"] if c in preview_df.columns]
-                    preview_display = preview_df[cols_to_show] if cols_to_show else preview_df
-                    # Raw Excel cells often mix plain numbers (1, 2, 3) with text ("R", "V",
-                    # "1 WITH COMMENTS") in the same column (e.g. latest_code, latest_rev).
-                    # Arrow can't serialize a mixed int/str object column, so stringify
-                    # everything for display purposes only -- the underlying import still
-                    # uses the original typed values.
-                    preview_display = preview_display.astype(object).where(preview_display.notna(), "").astype(str)
-                    st.dataframe(preview_display, use_container_width=True, hide_index=True)
-
-                    if dup:
-                        st.info(
-                            f"This exact workbook was already imported as **{dup['display_name']}** "
-                            f"(v{dup['version_number']}, {dup['uploaded_at'][:10]})."
+                with st.expander("Detected workbook structure", expanded=False):
+                    d1, d2, d3 = st.columns(3)
+                    d1.metric("Worksheet", discovery_info["sheet"])
+                    d2.metric("Header row", discovery_info["header_row"])
+                    d3.metric("Revision blocks", len(discovery_info["revision_blocks"]))
+                    st.caption(
+                        f"First data row: {discovery_info['data_start_row']} · "
+                        f"Template engine: v{discovered_layout.get('engine_version', TEMPLATE_ENGINE_VERSION)}"
+                    )
+                    field_rows = [
+                        {"Logical field": field.replace("_", " ").title(), "Detected column": column}
+                        for field, column in discovery_info["fields"].items()
+                    ]
+                    if field_rows:
+                        st.dataframe(pd.DataFrame(field_rows), use_container_width=True, hide_index=True)
+                    if discovery_info["revision_blocks"]:
+                        st.dataframe(
+                            pd.DataFrame(discovery_info["revision_blocks"]),
+                            use_container_width=True,
+                            hide_index=True,
                         )
 
-                    if not errors:
-                        st.markdown("#### Confirm Import")
-                        mode_options = ["Import as new workbook"]
-                        if imports:
-                            mode_options = ["Create New Version", "Replace Current Import", "Import as Separate Workbook"]
-                        version_choice = st.radio("Import mode", mode_options, horizontal=True)
-                        ic1, ic2 = st.columns([1, 4])
-                        if ic1.button("Confirm Import", type="primary"):
-                            mode_map = {
-                                "Create New Version": "new_version",
-                                "Replace Current Import": "replace",
-                                "Import as Separate Workbook": "separate",
-                                "Import as new workbook": "separate",
-                            }
-                            mode = mode_map[version_choice]
-                            parent_id = active_import_id if mode in ("new_version", "replace") else None
-                            try:
-                                with st.spinner("Importing..."):
-                                    new_import_id, import_warnings = run_import(
-                                        supabase, pending_bytes, pending_name, wb_project, wb_contractor,
-                                        review_period_days, mode, parent_id,
-                                        project_id=active_project_id,
-                                        template_id=active_project.get("template_id"),
-                                    )
-                                st.session_state.pop("pending_upload_bytes", None)
-                                st.session_state.pop("pending_upload_name", None)
-                                st.cache_data.clear()
-                                st.success(f"Import complete: {len(records)} documents imported.")
-                                st.rerun()
-                            except Exception as ex:
-                                st.error(f"Import failed: {ex}")
-                        if ic2.button("Cancel Upload"):
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                if warnings:
+                    for w in warnings:
+                        st.warning(w)
+
+                preview_df = pd.DataFrame(records[:10])
+                cols_to_show = [c for c in ["doc_no", "title", "discipline", "status", "latest_rev", "latest_code"] if c in preview_df.columns]
+                preview_display = preview_df[cols_to_show] if cols_to_show else preview_df
+                # Raw Excel cells often mix plain numbers (1, 2, 3) with text ("R", "V",
+                # "1 WITH COMMENTS") in the same column (e.g. latest_code, latest_rev).
+                # Arrow can't serialize a mixed int/str object column, so stringify
+                # everything for display purposes only -- the underlying import still
+                # uses the original typed values.
+                preview_display = preview_display.astype(object).where(preview_display.notna(), "").astype(str)
+                st.dataframe(preview_display, use_container_width=True, hide_index=True)
+
+                if dup:
+                    st.info(
+                        f"This exact workbook was already imported as **{dup['display_name']}** "
+                        f"(v{dup['version_number']}, {dup['uploaded_at'][:10]})."
+                    )
+
+                if not errors:
+                    st.markdown("#### Confirm Import")
+                    mode_options = ["Import as new workbook"]
+                    if imports:
+                        mode_options = ["Create New Version", "Replace Current Import", "Import as Separate Workbook"]
+                    version_choice = st.radio("Import mode", mode_options, horizontal=True)
+                    ic1, ic2 = st.columns([1, 4])
+                    if ic1.button("Confirm Import", type="primary"):
+                        mode_map = {
+                            "Create New Version": "new_version",
+                            "Replace Current Import": "replace",
+                            "Import as Separate Workbook": "separate",
+                            "Import as new workbook": "separate",
+                        }
+                        mode = mode_map[version_choice]
+                        parent_id = active_import_id if mode in ("new_version", "replace") else None
+                        try:
+                            with st.spinner("Importing..."):
+                                new_import_id, import_warnings = run_import(
+                                    supabase, pending_bytes, pending_name, wb_project, wb_contractor,
+                                    review_period_days, mode, parent_id,
+                                    project_id=active_project_id,
+                                    template_id=active_project.get("template_id"),
+                                )
                             st.session_state.pop("pending_upload_bytes", None)
                             st.session_state.pop("pending_upload_name", None)
+                            st.cache_data.clear()
+                            st.success(f"Import complete: {len(records)} documents imported.")
                             st.rerun()
-                except Exception as ex:
-                    st.error(f"Could not read this workbook: {ex}")
+                        except Exception as ex:
+                            st.error(f"Import failed: {ex}")
+                    if ic2.button("Cancel Upload"):
+                        st.session_state.pop("pending_upload_bytes", None)
+                        st.session_state.pop("pending_upload_name", None)
+                        st.rerun()
+            except Exception as ex:
+                st.error(f"Could not read this workbook: {ex}")
 
         st.markdown("---")
         st.subheader("Export")
@@ -4042,6 +3406,7 @@ try:
                 st.dataframe(pd.DataFrame(exp_res.data), use_container_width=True, hide_index=True)
             else:
                 st.caption("No exports recorded yet for this workbook.")
+
 except Exception as e:
     st.error(
         "Something went wrong while rendering the dashboard tabs. "
