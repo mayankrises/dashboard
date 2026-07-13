@@ -180,6 +180,8 @@ def load_form_config(_supabase, _df_signature=None):
 
 
 def save_form_config(supabase, config):
+    if not globals().get("CAN_ADMIN", False):
+        raise PermissionError("Admin access is required to change form configuration.")
     normalized = normalize_form_config(config)
     supabase.table("dashboard_settings").upsert(
         {
@@ -221,6 +223,281 @@ def get_supabase():
     if not url or not key:
         return None
     return create_client(url, key)
+
+
+@st.cache_resource
+def get_auth_supabase():
+    """Public Supabase client used only for end-user authentication."""
+    from supabase import create_client
+
+    try:
+        url = st.secrets.get("SUPABASE_URL")
+        anon_key = st.secrets.get("SUPABASE_ANON_KEY")
+    except Exception:
+        url = os.getenv("SUPABASE_URL")
+        anon_key = os.getenv("SUPABASE_ANON_KEY")
+    if not url or not anon_key:
+        return None
+    return create_client(url, anon_key)
+
+
+def _get_secret(name):
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return str(value or os.getenv(name, "")).strip()
+
+
+def _master_key():
+    return _get_secret("MASTER_ACCESS_KEY")
+
+
+def _clear_access_session():
+    for key in (
+        "access_context", "auth_access_token", "auth_refresh_token",
+        "active_project_id", "show_project_home", "pending_doc_changes",
+        "master_data_configuration_unlocked",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _profile_for_user(service_client, user_id):
+    result = (
+        service_client.table("user_profiles")
+        .select("*")
+        .eq("id", str(user_id))
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def _ensure_profile(service_client, user, full_name=""):
+    """Create the pending profile if the database trigger has not done so yet."""
+    if user is None:
+        return None
+    existing = _profile_for_user(service_client, user.id)
+    if existing:
+        return existing
+    metadata = getattr(user, "user_metadata", None) or {}
+    row = {
+        "id": str(user.id),
+        "email": getattr(user, "email", None),
+        "full_name": str(full_name or metadata.get("full_name") or "").strip() or None,
+        "role": "viewer",
+        "approval_status": "pending",
+        "is_active": True,
+    }
+    service_client.table("user_profiles").upsert(row, on_conflict="id").execute()
+    return _profile_for_user(service_client, user.id)
+
+
+def _set_user_access(user, session, profile):
+    st.session_state["auth_access_token"] = getattr(session, "access_token", None)
+    st.session_state["auth_refresh_token"] = getattr(session, "refresh_token", None)
+    st.session_state["access_context"] = {
+        "mode": "account",
+        "user_id": str(user.id),
+        "email": getattr(user, "email", "") or "",
+        "name": (profile or {}).get("full_name") or getattr(user, "email", "") or "User",
+        "role": (profile or {}).get("role") or "viewer",
+        "approval_status": (profile or {}).get("approval_status") or "pending",
+        "is_active": bool((profile or {}).get("is_active", True)),
+    }
+
+
+def _refresh_access_profile(service_client):
+    context = st.session_state.get("access_context") or {}
+    if context.get("mode") != "account" or not context.get("user_id"):
+        return context
+    profile = _profile_for_user(service_client, context["user_id"])
+    if profile:
+        context.update({
+            "name": profile.get("full_name") or context.get("email") or "User",
+            "role": profile.get("role") or "viewer",
+            "approval_status": profile.get("approval_status") or "pending",
+            "is_active": bool(profile.get("is_active", True)),
+        })
+        st.session_state["access_context"] = context
+    return context
+
+
+def render_auth_gate(service_client):
+    """Sign-in, sign-up, approval gate, and master-key override."""
+    auth_client = get_auth_supabase()
+    context = _refresh_access_profile(service_client)
+
+    if context:
+        if context.get("mode") == "master":
+            return context
+        if not context.get("is_active", True):
+            st.error("This account has been deactivated. Contact an administrator.")
+        elif context.get("approval_status") == "approved":
+            return context
+        elif context.get("approval_status") == "rejected":
+            st.error("This account request was rejected. Contact an administrator.")
+        else:
+            st.title("Account awaiting approval")
+            st.info(
+                f"You are signed in as **{context.get('email')}**, but an administrator "
+                "must approve your account before you can open project data."
+            )
+        if st.button("Sign out"):
+            try:
+                if auth_client:
+                    auth_client.auth.sign_out()
+            except Exception:
+                pass
+            _clear_access_session()
+            st.rerun()
+        st.stop()
+
+    st.title("DCI Project Hub")
+    st.caption("Secure sign-in for project dashboards and document control.")
+    signin_tab, signup_tab, master_tab = st.tabs(["Sign in", "Sign up", "Master access"])
+
+    with signin_tab:
+        if auth_client is None:
+            st.error("SUPABASE_ANON_KEY is not configured, so account sign-in is unavailable.")
+        email = st.text_input("Email", key="signin_email")
+        password = st.text_input("Password", type="password", key="signin_password")
+        if st.button("Sign in", type="primary", disabled=auth_client is None, key="signin_button"):
+            try:
+                response = auth_client.auth.sign_in_with_password({
+                    "email": email.strip(), "password": password,
+                })
+                user = response.user
+                profile = _ensure_profile(service_client, user)
+                _set_user_access(user, response.session, profile)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Sign-in failed: {exc}")
+
+        reset_email = st.text_input("Password-reset email", key="reset_email")
+        if st.button("Send password reset", disabled=auth_client is None, key="reset_button"):
+            try:
+                auth_client.auth.reset_password_for_email(reset_email.strip())
+                st.success("If that account exists, Supabase has sent a password-reset email.")
+            except Exception as exc:
+                st.error(f"Could not send reset email: {exc}")
+
+    with signup_tab:
+        if auth_client is None:
+            st.error("SUPABASE_ANON_KEY is not configured, so account registration is unavailable.")
+        full_name = st.text_input("Full name", key="signup_name")
+        signup_email = st.text_input("Work email", key="signup_email")
+        signup_password = st.text_input("Create password", type="password", key="signup_password")
+        signup_password_2 = st.text_input("Confirm password", type="password", key="signup_password_2")
+        signup_errors = []
+        if signup_password and len(signup_password) < 8:
+            signup_errors.append("Password must contain at least 8 characters.")
+        if signup_password_2 and signup_password != signup_password_2:
+            signup_errors.append("The passwords do not match.")
+        for message in signup_errors:
+            st.error(message)
+        if st.button(
+            "Create account", type="primary", key="signup_button",
+            disabled=auth_client is None or bool(signup_errors),
+        ):
+            if not full_name.strip() or not signup_email.strip() or not signup_password:
+                st.error("Full name, email, and password are required.")
+            else:
+                try:
+                    response = auth_client.auth.sign_up({
+                        "email": signup_email.strip(),
+                        "password": signup_password,
+                        "options": {"data": {"full_name": full_name.strip()}},
+                    })
+                    if response.user:
+                        profile = _ensure_profile(service_client, response.user, full_name)
+                        if response.session:
+                            _set_user_access(response.user, response.session, profile)
+                            st.rerun()
+                        else:
+                            st.success(
+                                "Account created. Confirm your email if Supabase sent a verification message, "
+                                "then sign in. An administrator must also approve the account."
+                            )
+                except Exception as exc:
+                    st.error(f"Could not create account: {exc}")
+
+    with master_tab:
+        st.warning("Master access grants full control. Use it only as an owner/emergency override.")
+        entered = st.text_input("Master key", type="password", key="master_access_key")
+        if not _master_key():
+            st.error("MASTER_ACCESS_KEY is not configured in secrets or the environment.")
+        if st.button("Enter with master access", type="primary", key="master_access_button"):
+            configured = _master_key()
+            if configured and hmac.compare_digest(entered, configured):
+                st.session_state["access_context"] = {
+                    "mode": "master", "user_id": None, "email": "master-access",
+                    "name": "Master Access", "role": "master",
+                    "approval_status": "approved", "is_active": True,
+                }
+                st.rerun()
+            else:
+                st.error("Incorrect master key.")
+
+    st.stop()
+
+
+def _can_edit(context):
+    return context.get("role") in {"editor", "admin", "master"}
+
+
+def _can_admin(context):
+    return context.get("role") in {"admin", "master"}
+
+
+def _actor_label(context):
+    if context.get("mode") == "master":
+        return "master-access"
+    return context.get("email") or context.get("name") or "authenticated-user"
+
+
+def render_user_management(service_client):
+    """Admin-only approval and role management panel."""
+    st.subheader("User access management")
+    result = service_client.table("user_profiles").select("*").order("created_at", desc=True).execute()
+    profiles = result.data or []
+    if not profiles:
+        st.caption("No registered account profiles yet.")
+        return
+
+    for profile in profiles:
+        user_id = profile["id"]
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([2, 1, 1])
+            c1.markdown(f"**{profile.get('full_name') or 'Unnamed user'}**")
+            c1.caption(profile.get("email") or user_id)
+            role_options = ["viewer", "editor", "admin"]
+            current_role = profile.get("role") if profile.get("role") in role_options else "viewer"
+            new_role = c2.selectbox(
+                "Role", role_options, index=role_options.index(current_role),
+                key=f"profile_role_{user_id}",
+            )
+            status_options = ["pending", "approved", "rejected"]
+            current_status = profile.get("approval_status") if profile.get("approval_status") in status_options else "pending"
+            new_status = c3.selectbox(
+                "Status", status_options, index=status_options.index(current_status),
+                key=f"profile_status_{user_id}",
+            )
+            active = st.checkbox(
+                "Account active", value=bool(profile.get("is_active", True)),
+                key=f"profile_active_{user_id}",
+            )
+            if st.button("Save access", key=f"save_profile_{user_id}"):
+                service_client.table("user_profiles").update({
+                    "role": new_role,
+                    "approval_status": new_status,
+                    "is_active": active,
+                    "approved_at": datetime.now().isoformat() if new_status == "approved" else None,
+                    "approved_by": CURRENT_ACTOR,
+                    "updated_at": datetime.now().isoformat(),
+                }).eq("id", user_id).execute()
+                st.success("User access updated.")
+                st.rerun()
 
 
 
@@ -890,6 +1167,8 @@ def list_templates(supabase):
 
 def create_template(supabase, *, name, file_bytes, filename, description=""):
     """Validate, store, and register a reusable DCI template."""
+    if not globals().get("CAN_ADMIN", False):
+        raise PermissionError("Admin access is required to create templates.")
     _ws, layout, diagnostics = inspect_workbook_bytes(file_bytes)
     template_row = {
         "template_name": str(name).strip() or filename,
@@ -924,6 +1203,8 @@ def create_template(supabase, *, name, file_bytes, filename, description=""):
 
 
 def create_project(supabase, *, project_name, contractor, client, review_period_days, template_id):
+    if not globals().get("CAN_ADMIN", False):
+        raise PermissionError("Admin access is required to create projects.")
     row = {
         "project_name": str(project_name).strip(),
         "contractor": str(contractor or "").strip() or None,
@@ -962,6 +1243,8 @@ def upload_workbook_to_storage(supabase, import_id, file_bytes, filename):
 def run_import(supabase, file_bytes, filename, project_name, contractor,
                 review_period_days, version_mode, parent_import_id=None,
                 project_id=None, template_id=None):
+    if not globals().get("CAN_ADMIN", False):
+        raise PermissionError("Admin access is required to import workbooks.")
     """Import a workbook without deactivating the current version prematurely.
 
     Supabase/PostgREST calls are not a single database transaction from Python, so
@@ -1256,6 +1539,8 @@ def build_change_diff(form_values, current_record):
 
 def save_document_changes(supabase, document_id, form_values, current_record, changed_by, event_type):
     """Persist changed fields atomically through the database RPC."""
+    if not globals().get("CAN_EDIT", False):
+        raise PermissionError("Editor access is required to update documents.")
     record_diff = build_change_diff(form_values, current_record)
     if not record_diff:
         return False, []
@@ -1402,6 +1687,8 @@ def _find_revision_block(ws, row_number, revision, revision_blocks):
 
 
 def generate_updated_workbook(supabase, import_id):
+    if not globals().get("CAN_ADMIN", False):
+        raise PermissionError("Admin access is required to generate official workbook exports.")
     import openpyxl
 
     meta = get_import_meta(supabase, import_id)
@@ -1522,11 +1809,11 @@ def generate_updated_workbook(supabase, import_id):
     return buf.getvalue(), filename
 
 
-def record_export(supabase, import_id, export_type, filename, row_count, exported_by="dashboard-user"):
+def record_export(supabase, import_id, export_type, filename, row_count, exported_by=None):
     supabase.table("export_records").insert({
         "import_id": import_id,
         "export_type": export_type,
-        "exported_by": exported_by,
+        "exported_by": exported_by or globals().get("CURRENT_ACTOR", "authenticated-user"),
         "filename": filename,
         "row_count": row_count,
         "success": True,
@@ -1941,6 +2228,12 @@ if supabase is None:
     )
     st.stop()
 
+# Authenticate before any project data or server-side write controls are rendered.
+ACCESS_CONTEXT = render_auth_gate(supabase)
+CAN_EDIT = _can_edit(ACCESS_CONTEXT)
+CAN_ADMIN = _can_admin(ACCESS_CONTEXT)
+CURRENT_ACTOR = _actor_label(ACCESS_CONTEXT)
+
 # ----------------------------------------------------------------------------
 # PROJECT HOME / PROJECT SELECTION
 # ----------------------------------------------------------------------------
@@ -1955,6 +2248,11 @@ def _clear_pending_upload():
 def render_project_home(supabase):
     st.title("DCI Project Home")
     st.caption("Open an existing project or create a new one from a reusable Excel template.")
+    st.caption(f"Signed in as **{ACCESS_CONTEXT.get('name')}** · Role: **{ACCESS_CONTEXT.get('role').title()}**")
+
+    if CAN_ADMIN:
+        with st.expander("👥 User Access Management", expanded=False):
+            render_user_management(supabase)
 
     projects = list_projects(supabase)
     if projects:
@@ -1989,6 +2287,9 @@ def render_project_home(supabase):
         st.info("No projects exist yet. Create the first project below.")
 
     st.markdown("---")
+    if not CAN_ADMIN:
+        st.info("Only an Admin or Master user can create a new project.")
+        return
     st.subheader("＋ Create New Project")
     with st.container(border=True):
         project_name = st.text_input("Project name *", key="new_project_name")
@@ -2100,6 +2401,16 @@ if not active_project:
 # SIDEBAR
 # ----------------------------------------------------------------------------
 st.sidebar.title("DCI Dashboard")
+st.sidebar.caption(f"{ACCESS_CONTEXT.get('name')} · {ACCESS_CONTEXT.get('role').title()}")
+if st.sidebar.button("Sign out", use_container_width=True):
+    try:
+        auth_client = get_auth_supabase()
+        if auth_client and ACCESS_CONTEXT.get("mode") == "account":
+            auth_client.auth.sign_out()
+    except Exception:
+        pass
+    _clear_access_session()
+    st.rerun()
 if st.sidebar.button("← Project Home", use_container_width=True):
     st.session_state["show_project_home"] = True
     _clear_pending_upload()
@@ -2124,11 +2435,14 @@ with st.sidebar.expander("Workbook", expanded=True):
         active_import = None
         st.info("No workbook imported yet. Upload one in the **Import / Export** tab.")
 
-    new_upload = st.file_uploader("Upload a new DCI workbook (.xlsx)", type=["xlsx"], key="sidebar_uploader")
-    if new_upload is not None:
-        st.session_state["pending_upload_bytes"] = new_upload.getvalue()
-        st.session_state["pending_upload_name"] = new_upload.name
-        st.info("Go to the **Import / Export** tab to validate and confirm this upload.")
+    if CAN_ADMIN:
+        new_upload = st.file_uploader("Upload a new DCI workbook (.xlsx)", type=["xlsx"], key="sidebar_uploader")
+        if new_upload is not None:
+            st.session_state["pending_upload_bytes"] = new_upload.getvalue()
+            st.session_state["pending_upload_name"] = new_upload.name
+            st.info("Go to the **Import / Export** tab to validate and confirm this upload.")
+    else:
+        st.caption("Workbook import is available to Admin and Master users only.")
 
 st.sidebar.markdown("---")
 with st.sidebar.expander("Project Settings", expanded=True):
@@ -2657,6 +2971,8 @@ try:
             st.info("No workbook imported yet.")
         else:
             st.subheader("Update Document")
+            if not CAN_EDIT:
+                st.warning("Your Viewer role is read-only. An Editor, Admin, or Master user can save document updates.")
             selector_options = build_document_selector_options(df)
             option_labels = [label for label, _ in selector_options]
             id_by_label = dict(selector_options)
@@ -2720,12 +3036,12 @@ try:
                     new_revision = st.selectbox(
                         "Revision", revision_choices,
                         index=revision_choices.index(current_revision) if current_revision in revision_choices else 0,
-                        key=f"revision_{document_id}",
+                        key=f"revision_{document_id}", disabled=not CAN_EDIT,
                     )
                     new_code = st.selectbox(
                         "Return Code", code_choices,
                         index=code_choices.index(current_code) if current_code in code_choices else 0,
-                        key=f"return_code_{document_id}",
+                        key=f"return_code_{document_id}", disabled=not CAN_EDIT,
                     )
                     derived_status = CODE_TO_DCI_STATUS.get(new_code, "UNMAPPED")
                     st.text_input("DCI Status (automatic)", value=derived_status, disabled=True,
@@ -2733,11 +3049,11 @@ try:
                 with right:
                     revision_date = st.date_input(
                         "Revision Date", value=_safe_date(doc_row["latest_uploaded_date"]),
-                        key=f"revision_date_{document_id}",
+                        key=f"revision_date_{document_id}", disabled=not CAN_EDIT,
                     )
                     return_date = st.date_input(
                         "Return Date", value=_safe_date(doc_row["latest_from_eil_date"]),
-                        key=f"return_date_{document_id}",
+                        key=f"return_date_{document_id}", disabled=not CAN_EDIT,
                     )
 
                 validation_errors = []
@@ -2768,10 +3084,10 @@ try:
                     st.caption("No additional comments have been added.")
                 new_comment = st.text_area(
                     "Add Comment", placeholder="Enter an optional comment for this revision update…",
-                    key=f"new_comment_{document_id}",
+                    key=f"new_comment_{document_id}", disabled=not CAN_EDIT,
                 )
 
-                if st.button("Save Revision Update", type="primary", disabled=bool(validation_errors),
+                if st.button("Save Revision Update", type="primary", disabled=bool(validation_errors) or not CAN_EDIT,
                              key=f"save_revision_{document_id}"):
                     remarks_value = existing_remarks
                     clean_comment = new_comment.strip() if new_comment else ""
@@ -2791,7 +3107,7 @@ try:
 
                     changed, diff = save_document_changes(
                         supabase, document_id, form_values, doc_row.to_dict(),
-                        changed_by="dashboard-user", event_type="revision_updated",
+                        changed_by=CURRENT_ACTOR, event_type="revision_updated",
                     )
                     if changed:
                         st.success(f"Saved {len(diff)} change(s) to {doc_row['doc_no']}.")
@@ -2800,34 +3116,9 @@ try:
                         st.info("No changes were detected.")
 
                 st.markdown("---")
-                with st.expander("⚙ Admin Configuration", expanded=False):
-                    st.caption(
-                        "The password protects master-data configuration only. Normal document updates remain available without it."
-                    )
-                    admin_password = get_admin_password()
-                    unlock_key = "master_data_configuration_unlocked"
-
-                    if not admin_password_configured():
-                        st.error(
-                            "ADMIN_PASSWORD is not configured. Add it to `.streamlit/secrets.toml` "
-                            "or the ADMIN_PASSWORD environment variable, then restart the app."
-                        )
-                    elif not st.session_state.get(unlock_key, False):
-                        entered_password = st.text_input("Admin password", type="password",
-                                                         key="master_data_configuration_password")
-                        if st.button("Unlock Configuration", key="unlock_master_data_configuration"):
-                            if hmac.compare_digest(entered_password, admin_password):
-                                st.session_state[unlock_key] = True
-                                st.rerun()
-                            else:
-                                st.error("Incorrect password.")
-                    else:
-                        top1, top2 = st.columns([4, 1])
-                        top1.success("Configuration is unlocked.")
-                        if top2.button("Lock", key="lock_master_data_configuration"):
-                            st.session_state[unlock_key] = False
-                            st.rerun()
-
+                if CAN_ADMIN:
+                    with st.expander("⚙ Admin Configuration", expanded=False):
+                        st.caption("Admin/master users can manage revision, code, discipline, and vendor master data.")
                         c1, c2 = st.columns(2)
                         with c1:
                             st.markdown("##### Revision options")
@@ -2901,7 +3192,6 @@ try:
                                 st.rerun()
                             except Exception as exc:
                                 st.error("Could not reset configuration: " + str(exc))
-
     # TAB 11: DOCUMENT TIMELINE
     # ------------------------------------------------------------------
     with tabs[10]:
@@ -2985,176 +3275,179 @@ try:
     # TAB 12: IMPORT / EXPORT
     # ------------------------------------------------------------------
     with tabs[11]:
-        st.subheader("Import")
-
-        pending_bytes = st.session_state.get("pending_upload_bytes")
-        pending_name = st.session_state.get("pending_upload_name")
-
-        tab_upload = st.file_uploader("Upload a DCI workbook (.xlsx)", type=["xlsx"], key="import_tab_uploader")
-        if tab_upload is not None:
-            pending_bytes = tab_upload.getvalue()
-            pending_name = tab_upload.name
-            st.session_state["pending_upload_bytes"] = pending_bytes
-            st.session_state["pending_upload_name"] = pending_name
-
-        if pending_bytes is None:
-            st.caption("No pending workbook. Upload a populated workbook above when project documents are ready.")
-            if active_project.get("template_id"):
-                try:
-                    template_bytes, template_meta = get_template_bytes(supabase, active_project["template_id"])
-                    st.download_button(
-                        "Download Project Template",
-                        data=template_bytes,
-                        file_name=template_meta.get("original_filename") or "DCI_Template.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-                except Exception as template_exc:
-                    st.warning(f"The project template could not be loaded: {template_exc}")
+        if not CAN_ADMIN:
+            st.warning("Import and official export are available to Admin and Master users only.")
         else:
-            try:
-                _preview_ws, discovered_layout, discovery_info = inspect_workbook_bytes(pending_bytes)
-                records, history, wb_project, wb_contractor = parse_workbook_bytes(pending_bytes)
-                warnings, errors = validate_records(records)
-                file_hash = workbook_hash(pending_bytes)
-                dup = find_import_by_hash(supabase, file_hash, active_project_id)
+            st.subheader("Import")
 
-                st.markdown("#### Preview")
-                p1, p2, p3 = st.columns(3)
-                p1.metric("Filename", pending_name)
-                p2.metric("Rows Found", len(records))
-                p3.metric("Warnings", len(warnings))
+            pending_bytes = st.session_state.get("pending_upload_bytes")
+            pending_name = st.session_state.get("pending_upload_name")
 
-                with st.expander("Detected workbook structure", expanded=False):
-                    d1, d2, d3 = st.columns(3)
-                    d1.metric("Worksheet", discovery_info["sheet"])
-                    d2.metric("Header row", discovery_info["header_row"])
-                    d3.metric("Revision blocks", len(discovery_info["revision_blocks"]))
-                    st.caption(
-                        f"First data row: {discovery_info['data_start_row']} · "
-                        f"Template engine: v{discovered_layout.get('engine_version', TEMPLATE_ENGINE_VERSION)}"
-                    )
-                    field_rows = [
-                        {"Logical field": field.replace("_", " ").title(), "Detected column": column}
-                        for field, column in discovery_info["fields"].items()
-                    ]
-                    if field_rows:
-                        st.dataframe(pd.DataFrame(field_rows), use_container_width=True, hide_index=True)
-                    if discovery_info["revision_blocks"]:
-                        st.dataframe(
-                            pd.DataFrame(discovery_info["revision_blocks"]),
-                            use_container_width=True,
-                            hide_index=True,
+            tab_upload = st.file_uploader("Upload a DCI workbook (.xlsx)", type=["xlsx"], key="import_tab_uploader")
+            if tab_upload is not None:
+                pending_bytes = tab_upload.getvalue()
+                pending_name = tab_upload.name
+                st.session_state["pending_upload_bytes"] = pending_bytes
+                st.session_state["pending_upload_name"] = pending_name
+
+            if pending_bytes is None:
+                st.caption("No pending workbook. Upload a populated workbook above when project documents are ready.")
+                if active_project.get("template_id"):
+                    try:
+                        template_bytes, template_meta = get_template_bytes(supabase, active_project["template_id"])
+                        st.download_button(
+                            "Download Project Template",
+                            data=template_bytes,
+                            file_name=template_meta.get("original_filename") or "DCI_Template.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
+                    except Exception as template_exc:
+                        st.warning(f"The project template could not be loaded: {template_exc}")
+            else:
+                try:
+                    _preview_ws, discovered_layout, discovery_info = inspect_workbook_bytes(pending_bytes)
+                    records, history, wb_project, wb_contractor = parse_workbook_bytes(pending_bytes)
+                    warnings, errors = validate_records(records)
+                    file_hash = workbook_hash(pending_bytes)
+                    dup = find_import_by_hash(supabase, file_hash, active_project_id)
+
+                    st.markdown("#### Preview")
+                    p1, p2, p3 = st.columns(3)
+                    p1.metric("Filename", pending_name)
+                    p2.metric("Rows Found", len(records))
+                    p3.metric("Warnings", len(warnings))
+
+                    with st.expander("Detected workbook structure", expanded=False):
+                        d1, d2, d3 = st.columns(3)
+                        d1.metric("Worksheet", discovery_info["sheet"])
+                        d2.metric("Header row", discovery_info["header_row"])
+                        d3.metric("Revision blocks", len(discovery_info["revision_blocks"]))
+                        st.caption(
+                            f"First data row: {discovery_info['data_start_row']} · "
+                            f"Template engine: v{discovered_layout.get('engine_version', TEMPLATE_ENGINE_VERSION)}"
+                        )
+                        field_rows = [
+                            {"Logical field": field.replace("_", " ").title(), "Detected column": column}
+                            for field, column in discovery_info["fields"].items()
+                        ]
+                        if field_rows:
+                            st.dataframe(pd.DataFrame(field_rows), use_container_width=True, hide_index=True)
+                        if discovery_info["revision_blocks"]:
+                            st.dataframe(
+                                pd.DataFrame(discovery_info["revision_blocks"]),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                    if warnings:
+                        for w in warnings:
+                            st.warning(w)
+
+                    preview_df = pd.DataFrame(records[:10])
+                    cols_to_show = [c for c in ["doc_no", "title", "discipline", "status", "latest_rev", "latest_code"] if c in preview_df.columns]
+                    preview_display = preview_df[cols_to_show] if cols_to_show else preview_df
+                    # Raw Excel cells often mix plain numbers (1, 2, 3) with text ("R", "V",
+                    # "1 WITH COMMENTS") in the same column (e.g. latest_code, latest_rev).
+                    # Arrow can't serialize a mixed int/str object column, so stringify
+                    # everything for display purposes only -- the underlying import still
+                    # uses the original typed values.
+                    preview_display = preview_display.astype(object).where(preview_display.notna(), "").astype(str)
+                    st.dataframe(preview_display, use_container_width=True, hide_index=True)
+
+                    if dup:
+                        st.info(
+                            f"This exact workbook was already imported as **{dup['display_name']}** "
+                            f"(v{dup['version_number']}, {dup['uploaded_at'][:10]})."
                         )
 
-                if errors:
-                    for e in errors:
-                        st.error(e)
-                if warnings:
-                    for w in warnings:
-                        st.warning(w)
-
-                preview_df = pd.DataFrame(records[:10])
-                cols_to_show = [c for c in ["doc_no", "title", "discipline", "status", "latest_rev", "latest_code"] if c in preview_df.columns]
-                preview_display = preview_df[cols_to_show] if cols_to_show else preview_df
-                # Raw Excel cells often mix plain numbers (1, 2, 3) with text ("R", "V",
-                # "1 WITH COMMENTS") in the same column (e.g. latest_code, latest_rev).
-                # Arrow can't serialize a mixed int/str object column, so stringify
-                # everything for display purposes only -- the underlying import still
-                # uses the original typed values.
-                preview_display = preview_display.astype(object).where(preview_display.notna(), "").astype(str)
-                st.dataframe(preview_display, use_container_width=True, hide_index=True)
-
-                if dup:
-                    st.info(
-                        f"This exact workbook was already imported as **{dup['display_name']}** "
-                        f"(v{dup['version_number']}, {dup['uploaded_at'][:10]})."
-                    )
-
-                if not errors:
-                    st.markdown("#### Confirm Import")
-                    mode_options = ["Import as new workbook"]
-                    if imports:
-                        mode_options = ["Create New Version", "Replace Current Import", "Import as Separate Workbook"]
-                    version_choice = st.radio("Import mode", mode_options, horizontal=True)
-                    ic1, ic2 = st.columns([1, 4])
-                    if ic1.button("Confirm Import", type="primary"):
-                        mode_map = {
-                            "Create New Version": "new_version",
-                            "Replace Current Import": "replace",
-                            "Import as Separate Workbook": "separate",
-                            "Import as new workbook": "separate",
-                        }
-                        mode = mode_map[version_choice]
-                        parent_id = active_import_id if mode in ("new_version", "replace") else None
-                        try:
-                            with st.spinner("Importing..."):
-                                new_import_id, import_warnings = run_import(
-                                    supabase, pending_bytes, pending_name, wb_project, wb_contractor,
-                                    review_period_days, mode, parent_id,
-                                    project_id=active_project_id,
-                                    template_id=active_project.get("template_id"),
-                                )
+                    if not errors:
+                        st.markdown("#### Confirm Import")
+                        mode_options = ["Import as new workbook"]
+                        if imports:
+                            mode_options = ["Create New Version", "Replace Current Import", "Import as Separate Workbook"]
+                        version_choice = st.radio("Import mode", mode_options, horizontal=True)
+                        ic1, ic2 = st.columns([1, 4])
+                        if ic1.button("Confirm Import", type="primary"):
+                            mode_map = {
+                                "Create New Version": "new_version",
+                                "Replace Current Import": "replace",
+                                "Import as Separate Workbook": "separate",
+                                "Import as new workbook": "separate",
+                            }
+                            mode = mode_map[version_choice]
+                            parent_id = active_import_id if mode in ("new_version", "replace") else None
+                            try:
+                                with st.spinner("Importing..."):
+                                    new_import_id, import_warnings = run_import(
+                                        supabase, pending_bytes, pending_name, wb_project, wb_contractor,
+                                        review_period_days, mode, parent_id,
+                                        project_id=active_project_id,
+                                        template_id=active_project.get("template_id"),
+                                    )
+                                st.session_state.pop("pending_upload_bytes", None)
+                                st.session_state.pop("pending_upload_name", None)
+                                st.cache_data.clear()
+                                st.success(f"Import complete: {len(records)} documents imported.")
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"Import failed: {ex}")
+                        if ic2.button("Cancel Upload"):
                             st.session_state.pop("pending_upload_bytes", None)
                             st.session_state.pop("pending_upload_name", None)
-                            st.cache_data.clear()
-                            st.success(f"Import complete: {len(records)} documents imported.")
                             st.rerun()
-                        except Exception as ex:
-                            st.error(f"Import failed: {ex}")
-                    if ic2.button("Cancel Upload"):
-                        st.session_state.pop("pending_upload_bytes", None)
-                        st.session_state.pop("pending_upload_name", None)
-                        st.rerun()
-            except Exception as ex:
-                st.error(f"Could not read this workbook: {ex}")
+                except Exception as ex:
+                    st.error(f"Could not read this workbook: {ex}")
 
-        st.markdown("---")
-        st.subheader("Export")
+            st.markdown("---")
+            st.subheader("Export")
 
-        if not active_import_id:
-            st.caption("No active workbook to export.")
-        else:
-            ec1, ec2 = st.columns(2)
-            with ec1:
-                if st.button("Generate Updated Workbook (.xlsx)"):
-                    with st.spinner("Regenerating workbook from current data..."):
-                        try:
-                            wb_bytes, wb_filename = generate_updated_workbook(supabase, active_import_id)
-                            record_export(supabase, active_import_id, "workbook", wb_filename, len(df))
-                            st.download_button(
-                                "Download Updated Workbook", data=wb_bytes, file_name=wb_filename,
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            )
-                        except Exception as ex:
-                            st.error(f"Export failed: {ex}")
-            with ec2:
-                if has_data:
-                    all_history_rows = get_history_for_documents(supabase, df["document_id"].dropna().unique().tolist())
-                    if all_history_rows:
-                        hist_csv = pd.DataFrame(all_history_rows).to_csv(index=False).encode("utf-8")
-                        st.download_button(
-                            "Download History Report (CSV)", data=hist_csv,
-                            file_name=f"dci_history_report_{datetime.now().strftime('%Y-%m-%d')}.csv",
-                            mime="text/csv",
-                        )
-                    else:
-                        st.caption("No history events recorded yet.")
-
-            if has_data:
-                filtered_csv = filtered.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download Filtered Document Register (CSV)", data=filtered_csv,
-                    file_name=f"dci_filtered_register_{datetime.now().strftime('%Y-%m-%d')}.csv",
-                    mime="text/csv",
-                )
-
-            st.markdown("#### Previous Exports")
-            exp_res = supabase.table("export_records").select("*").eq("import_id", active_import_id) \
-                .order("exported_at", desc=True).limit(20).execute()
-            if exp_res.data:
-                st.dataframe(pd.DataFrame(exp_res.data), use_container_width=True, hide_index=True)
+            if not active_import_id:
+                st.caption("No active workbook to export.")
             else:
-                st.caption("No exports recorded yet for this workbook.")
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    if st.button("Generate Updated Workbook (.xlsx)"):
+                        with st.spinner("Regenerating workbook from current data..."):
+                            try:
+                                wb_bytes, wb_filename = generate_updated_workbook(supabase, active_import_id)
+                                record_export(supabase, active_import_id, "workbook", wb_filename, len(df))
+                                st.download_button(
+                                    "Download Updated Workbook", data=wb_bytes, file_name=wb_filename,
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                )
+                            except Exception as ex:
+                                st.error(f"Export failed: {ex}")
+                with ec2:
+                    if has_data:
+                        all_history_rows = get_history_for_documents(supabase, df["document_id"].dropna().unique().tolist())
+                        if all_history_rows:
+                            hist_csv = pd.DataFrame(all_history_rows).to_csv(index=False).encode("utf-8")
+                            st.download_button(
+                                "Download History Report (CSV)", data=hist_csv,
+                                file_name=f"dci_history_report_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                                mime="text/csv",
+                            )
+                        else:
+                            st.caption("No history events recorded yet.")
+
+                if has_data:
+                    filtered_csv = filtered.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download Filtered Document Register (CSV)", data=filtered_csv,
+                        file_name=f"dci_filtered_register_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                        mime="text/csv",
+                    )
+
+                st.markdown("#### Previous Exports")
+                exp_res = supabase.table("export_records").select("*").eq("import_id", active_import_id) \
+                    .order("exported_at", desc=True).limit(20).execute()
+                if exp_res.data:
+                    st.dataframe(pd.DataFrame(exp_res.data), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No exports recorded yet for this workbook.")
 
 except Exception as e:
     st.error(
