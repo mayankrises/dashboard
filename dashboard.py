@@ -14,7 +14,8 @@ import hmac
 import os
 import io
 import zipfile
-from datetime import datetime, date
+import secrets
+from datetime import datetime, date, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,40 @@ import streamlit as st
 # PAGE CONFIG
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="DCI Project Hub", layout="wide")
+
+
+def _early_secret(name):
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return str(value or os.getenv(name, "")).strip()
+
+
+try:
+    from streamlit_cookies_manager import EncryptedCookieManager
+except ImportError:
+    st.error(
+        "Persistent sign-in requires `streamlit-cookies-manager`. "
+        "Add `streamlit-cookies-manager==0.2.0` to requirements.txt and redeploy."
+    )
+    st.stop()
+
+_COOKIE_PASSWORD = _early_secret("COOKIES_PASSWORD")
+if not _COOKIE_PASSWORD:
+    st.error("COOKIES_PASSWORD is not configured in Streamlit secrets or the environment.")
+    st.stop()
+
+AUTH_COOKIES = EncryptedCookieManager(
+    prefix="dci-project-hub/",
+    password=_COOKIE_PASSWORD,
+)
+if not AUTH_COOKIES.ready():
+    st.stop()
+
+AUTH_COOKIE_NAME = "app_session"
+ACCOUNT_SESSION_DAYS = 30
+MASTER_SESSION_HOURS = 8
 
 
 APPROVED_CODES = {"1", "1 WITH COMMENTS"}
@@ -253,7 +288,68 @@ def _master_key():
     return _get_secret("MASTER_ACCESS_KEY")
 
 
-def _clear_access_session():
+def _session_token_hash(token):
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def _cookie_session_token():
+    try:
+        return str(AUTH_COOKIES.get(AUTH_COOKIE_NAME) or "").strip()
+    except Exception:
+        return ""
+
+
+def _write_session_cookie(token):
+    AUTH_COOKIES[AUTH_COOKIE_NAME] = str(token)
+    AUTH_COOKIES.save()
+
+
+def _delete_session_cookie():
+    try:
+        if AUTH_COOKIE_NAME in AUTH_COOKIES:
+            del AUTH_COOKIES[AUTH_COOKIE_NAME]
+            AUTH_COOKIES.save()
+    except Exception:
+        pass
+
+
+def _revoke_persistent_session(service_client):
+    token = _cookie_session_token()
+    if token:
+        try:
+            service_client.table("app_sessions").update({
+                "revoked_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("token_hash", _session_token_hash(token)).execute()
+        except Exception:
+            pass
+    _delete_session_cookie()
+
+
+def _create_persistent_session(service_client, context):
+    """Create a server-tracked opaque browser session.
+
+    The browser receives only a random opaque token. Supabase refresh/access tokens
+    are never placed in the browser cookie. A stolen database dump does not reveal
+    usable browser tokens because only SHA-256 hashes are stored.
+    """
+    raw_token = secrets.token_urlsafe(48)
+    now = datetime.now(timezone.utc)
+    is_master = context.get("mode") == "master"
+    expires_at = now + (timedelta(hours=MASTER_SESSION_HOURS) if is_master else timedelta(days=ACCOUNT_SESSION_DAYS))
+    service_client.table("app_sessions").insert({
+        "token_hash": _session_token_hash(raw_token),
+        "user_id": context.get("user_id"),
+        "access_mode": "master" if is_master else "account",
+        "expires_at": expires_at.isoformat(),
+        "created_at": now.isoformat(),
+        "last_seen_at": now.isoformat(),
+    }).execute()
+    _write_session_cookie(raw_token)
+
+
+def _clear_access_session(service_client=None, revoke=True):
+    if revoke and service_client is not None:
+        _revoke_persistent_session(service_client)
     for key in (
         "access_context", "auth_access_token", "auth_refresh_token",
         "active_project_id", "show_project_home", "pending_doc_changes",
@@ -274,7 +370,6 @@ def _profile_for_user(service_client, user_id):
 
 
 def _ensure_profile(service_client, user, full_name=""):
-    """Create the pending profile if the database trigger has not done so yet."""
     if user is None:
         return None
     existing = _profile_for_user(service_client, user.id)
@@ -315,6 +410,7 @@ def _refresh_access_profile(service_client):
     if profile:
         context.update({
             "name": profile.get("full_name") or context.get("email") or "User",
+            "email": profile.get("email") or context.get("email") or "",
             "role": profile.get("role") or "viewer",
             "approval_status": profile.get("approval_status") or "pending",
             "is_active": bool(profile.get("is_active", True)),
@@ -323,10 +419,61 @@ def _refresh_access_profile(service_client):
     return context
 
 
+def _restore_persistent_access(service_client):
+    if st.session_state.get("access_context"):
+        return _refresh_access_profile(service_client)
+    raw_token = _cookie_session_token()
+    if not raw_token:
+        return {}
+    token_hash = _session_token_hash(raw_token)
+    result = (
+        service_client.table("app_sessions")
+        .select("*")
+        .eq("token_hash", token_hash)
+        .is_("revoked_at", "null")
+        .limit(1)
+        .execute()
+    )
+    row = result.data[0] if result.data else None
+    now = datetime.now(timezone.utc)
+    if not row:
+        _delete_session_cookie()
+        return {}
+    expires_at = pd.to_datetime(row.get("expires_at"), utc=True, errors="coerce")
+    if pd.isna(expires_at) or expires_at.to_pydatetime() <= now:
+        service_client.table("app_sessions").update({"revoked_at": now.isoformat()}).eq("id", row["id"]).execute()
+        _delete_session_cookie()
+        return {}
+
+    if row.get("access_mode") == "master":
+        context = {
+            "mode": "master", "user_id": None, "email": "master-access",
+            "name": "Master Access", "role": "master",
+            "approval_status": "approved", "is_active": True,
+        }
+    else:
+        profile = _profile_for_user(service_client, row.get("user_id"))
+        if not profile:
+            _delete_session_cookie()
+            return {}
+        context = {
+            "mode": "account",
+            "user_id": str(profile["id"]),
+            "email": profile.get("email") or "",
+            "name": profile.get("full_name") or profile.get("email") or "User",
+            "role": profile.get("role") or "viewer",
+            "approval_status": profile.get("approval_status") or "pending",
+            "is_active": bool(profile.get("is_active", True)),
+        }
+    st.session_state["access_context"] = context
+    service_client.table("app_sessions").update({"last_seen_at": now.isoformat()}).eq("id", row["id"]).execute()
+    return context
+
+
 def render_auth_gate(service_client):
-    """Sign-in, sign-up, approval gate, and master-key override."""
+    """Sign-in, sign-up, approval gate, master override, and persistent sessions."""
     auth_client = get_auth_supabase()
-    context = _refresh_access_profile(service_client)
+    context = _restore_persistent_access(service_client)
 
     if context:
         if context.get("mode") == "master":
@@ -341,7 +488,7 @@ def render_auth_gate(service_client):
             st.title("Account awaiting approval")
             st.info(
                 f"You are signed in as **{context.get('email')}**, but an administrator "
-                "must approve your account before you can open project data."
+                "must approve your account and assign project access before you can open project data."
             )
         if st.button("Sign out"):
             try:
@@ -349,7 +496,7 @@ def render_auth_gate(service_client):
                     auth_client.auth.sign_out()
             except Exception:
                 pass
-            _clear_access_session()
+            _clear_access_session(service_client)
             st.rerun()
         st.stop()
 
@@ -370,6 +517,7 @@ def render_auth_gate(service_client):
                 user = response.user
                 profile = _ensure_profile(service_client, user)
                 _set_user_access(user, response.session, profile)
+                _create_persistent_session(service_client, st.session_state["access_context"])
                 st.rerun()
             except Exception as exc:
                 st.error(f"Sign-in failed: {exc}")
@@ -413,17 +561,18 @@ def render_auth_gate(service_client):
                         profile = _ensure_profile(service_client, response.user, full_name)
                         if response.session:
                             _set_user_access(response.user, response.session, profile)
+                            _create_persistent_session(service_client, st.session_state["access_context"])
                             st.rerun()
                         else:
                             st.success(
                                 "Account created. Confirm your email if Supabase sent a verification message, "
-                                "then sign in. An administrator must also approve the account."
+                                "then sign in. An administrator must approve the account and assign projects."
                             )
                 except Exception as exc:
                     st.error(f"Could not create account: {exc}")
 
     with master_tab:
-        st.warning("Master access grants full control. Use it only as an owner/emergency override.")
+        st.warning("Master access grants full control. It expires after eight hours.")
         entered = st.text_input("Master key", type="password", key="master_access_key")
         if not _master_key():
             st.error("MASTER_ACCESS_KEY is not configured in secrets or the environment.")
@@ -435,6 +584,7 @@ def render_auth_gate(service_client):
                     "name": "Master Access", "role": "master",
                     "approval_status": "approved", "is_active": True,
                 }
+                _create_persistent_session(service_client, st.session_state["access_context"])
                 st.rerun()
             else:
                 st.error("Incorrect master key.")
@@ -450,55 +600,318 @@ def _can_admin(context):
     return context.get("role") in {"admin", "master"}
 
 
+def _can_export(context):
+    return context.get("role") in {"viewer", "editor", "admin", "master"}
+
+
 def _actor_label(context):
     if context.get("mode") == "master":
         return "master-access"
     return context.get("email") or context.get("name") or "authenticated-user"
 
 
+def _verify_admin_safety_check(context, entered_secret):
+    """Require fresh credentials before changing access controls."""
+    entered_secret = str(entered_secret or "")
+    if context.get("mode") == "master":
+        configured = _master_key()
+        return bool(configured and hmac.compare_digest(entered_secret, configured))
+    email = context.get("email") or ""
+    if not email or not entered_secret:
+        return False
+    try:
+        client = get_auth_supabase()
+        response = client.auth.sign_in_with_password({"email": email, "password": entered_secret})
+        return bool(response and response.user and str(response.user.id) == str(context.get("user_id")))
+    except Exception:
+        return False
+
+
+def _direct_project_ids(service_client, user_id):
+    result = service_client.table("user_project_access").select("project_id").eq("user_id", str(user_id)).execute()
+    return {row["project_id"] for row in (result.data or [])}
+
+
+def _group_project_ids(service_client, user_id):
+    membership = service_client.table("project_group_members").select("group_id").eq("user_id", str(user_id)).execute()
+    group_ids = [row["group_id"] for row in (membership.data or [])]
+    if not group_ids:
+        return set()
+    groups = service_client.table("project_groups").select("project_id").in_("id", group_ids).eq("is_active", True).execute()
+    return {row["project_id"] for row in (groups.data or [])}
+
+
+def accessible_project_ids(service_client, context):
+    if _can_admin(context):
+        return None
+    user_id = context.get("user_id")
+    if not user_id:
+        return set()
+    return _direct_project_ids(service_client, user_id) | _group_project_ids(service_client, user_id)
+
+
+def _user_group_ids(service_client, user_id):
+    result = service_client.table("project_group_members").select("group_id").eq("user_id", str(user_id)).execute()
+    return {row["group_id"] for row in (result.data or [])}
+
+
 def render_user_management(service_client):
-    """Admin-only approval and role management panel."""
+    """Advanced approval, project assignment, role and project-group management."""
     st.subheader("User access management")
+    st.caption(
+        "Search for one account by name or email, then review and update that user's access. "
+        "Assign users directly to projects or place them in project groups."
+    )
+
+    projects = list_projects(service_client)
+    project_by_id = {p["id"]: p for p in projects}
+    project_label_to_id = {
+        f"{p.get('project_name') or 'Unnamed project'} · #{p['id']}": p["id"] for p in projects
+    }
+
+    st.markdown("#### Project groups")
+    groups_result = (
+        service_client.table("project_groups")
+        .select("*")
+        .eq("is_active", True)
+        .order("group_name")
+        .execute()
+    )
+    groups = groups_result.data or []
+
+    with st.container(border=True):
+        st.markdown("##### ＋ Create project group")
+        group_name = st.text_input("Group name", key="new_access_group_name")
+        group_project_label = st.selectbox(
+            "Project",
+            list(project_label_to_id.keys()) if project_label_to_id else ["No projects available"],
+            key="new_access_group_project",
+        )
+        group_description = st.text_area(
+            "Description",
+            placeholder="Example: Mechanical document-control team",
+            key="new_access_group_description",
+        )
+        if st.button("Create group", key="create_access_group", disabled=not project_label_to_id):
+            if not group_name.strip():
+                st.error("Group name is required.")
+            else:
+                service_client.table("project_groups").insert({
+                    "project_id": project_label_to_id[group_project_label],
+                    "group_name": group_name.strip(),
+                    "description": group_description.strip() or None,
+                    "created_by": CURRENT_ACTOR,
+                    "is_active": True,
+                }).execute()
+                st.success("Project group created.")
+                st.rerun()
+
+    if groups:
+        group_rows = []
+        for group in groups:
+            members = (
+                service_client.table("project_group_members")
+                .select("user_id", count="exact")
+                .eq("group_id", group["id"])
+                .execute()
+            )
+            group_rows.append({
+                "Group": group.get("group_name"),
+                "Project": (project_by_id.get(group.get("project_id")) or {}).get(
+                    "project_name", group.get("project_id")
+                ),
+                "Members": members.count or 0,
+                "Description": group.get("description") or "",
+                "Email scope": "Planned",
+            })
+        st.dataframe(pd.DataFrame(group_rows), use_container_width=True, hide_index=True)
+
     result = service_client.table("user_profiles").select("*").order("created_at", desc=True).execute()
     profiles = result.data or []
     if not profiles:
         st.caption("No registered account profiles yet.")
         return
 
-    for profile in profiles:
-        user_id = profile["id"]
-        with st.container(border=True):
-            c1, c2, c3 = st.columns([2, 1, 1])
-            c1.markdown(f"**{profile.get('full_name') or 'Unnamed user'}**")
-            c1.caption(profile.get("email") or user_id)
-            role_options = ["viewer", "editor", "admin"]
-            current_role = profile.get("role") if profile.get("role") in role_options else "viewer"
-            new_role = c2.selectbox(
-                "Role", role_options, index=role_options.index(current_role),
-                key=f"profile_role_{user_id}",
-            )
-            status_options = ["pending", "approved", "rejected"]
-            current_status = profile.get("approval_status") if profile.get("approval_status") in status_options else "pending"
-            new_status = c3.selectbox(
-                "Status", status_options, index=status_options.index(current_status),
-                key=f"profile_status_{user_id}",
-            )
-            active = st.checkbox(
-                "Account active", value=bool(profile.get("is_active", True)),
-                key=f"profile_active_{user_id}",
-            )
-            if st.button("Save access", key=f"save_profile_{user_id}"):
-                service_client.table("user_profiles").update({
-                    "role": new_role,
-                    "approval_status": new_status,
-                    "is_active": active,
-                    "approved_at": datetime.now().isoformat() if new_status == "approved" else None,
-                    "approved_by": CURRENT_ACTOR,
-                    "updated_at": datetime.now().isoformat(),
-                }).eq("id", user_id).execute()
-                st.success("User access updated.")
-                st.rerun()
+    group_label_to_id = {
+        f"{g.get('group_name')} · {(project_by_id.get(g.get('project_id')) or {}).get('project_name', 'Unknown project')}": g["id"]
+        for g in groups
+    }
 
+    st.markdown("#### Find a user")
+    st.caption("Click the dropdown and type any part of the person's name or email address.")
+
+    # Keep user IDs as stable option values. Streamlit's selectbox supports type-to-search,
+    # while format_func displays a useful name/email label.
+    profile_by_id = {str(profile["id"]): profile for profile in profiles}
+    ordered_user_ids = sorted(
+        profile_by_id,
+        key=lambda uid: (
+            str(profile_by_id[uid].get("approval_status") or "pending") != "pending",
+            str(profile_by_id[uid].get("full_name") or "").casefold(),
+            str(profile_by_id[uid].get("email") or "").casefold(),
+        ),
+    )
+
+    def _user_option_label(user_id):
+        profile = profile_by_id[user_id]
+        name = str(profile.get("full_name") or "Unnamed user").strip()
+        email = str(profile.get("email") or user_id).strip()
+        role = str(profile.get("role") or "viewer").title()
+        status = str(profile.get("approval_status") or "pending").title()
+        return f"{name} — {email} · {role} · {status}"
+
+    selected_user_id = st.selectbox(
+        "Search name or email",
+        ordered_user_ids,
+        format_func=_user_option_label,
+        key="user_management_selected_user",
+        placeholder="Choose or type to search for a user",
+    )
+    profile = profile_by_id.get(str(selected_user_id))
+    if not profile:
+        st.info("Select an account to manage its access.")
+        return
+
+    user_id = str(profile["id"])
+    with st.container(border=True):
+        top1, top2, top3 = st.columns([3, 1, 1])
+        top1.markdown(f"### {profile.get('full_name') or 'Unnamed user'}")
+        top1.markdown(f"[{profile.get('email') or user_id}](mailto:{profile.get('email') or ''})")
+        top2.metric("Current role", str(profile.get("role") or "viewer").title())
+        top3.metric("Status", str(profile.get("approval_status") or "pending").title())
+        st.caption(f"Account created: {str(profile.get('created_at') or '')[:10]}")
+
+        c1, c2, c3 = st.columns(3)
+        role_options = ["viewer", "editor", "admin"]
+        current_role = profile.get("role") if profile.get("role") in role_options else "viewer"
+        new_role = c1.selectbox(
+            "Role",
+            role_options,
+            index=role_options.index(current_role),
+            key=f"profile_role_{user_id}",
+        )
+        status_options = ["pending", "approved", "rejected"]
+        current_status = (
+            profile.get("approval_status")
+            if profile.get("approval_status") in status_options
+            else "pending"
+        )
+        new_status = c2.selectbox(
+            "Status",
+            status_options,
+            index=status_options.index(current_status),
+            key=f"profile_status_{user_id}",
+        )
+        active = c3.checkbox(
+            "Account active",
+            value=bool(profile.get("is_active", True)),
+            key=f"profile_active_{user_id}",
+        )
+
+        current_direct = _direct_project_ids(service_client, user_id)
+        current_project_labels = [
+            label for label, pid in project_label_to_id.items() if pid in current_direct
+        ]
+        selected_project_labels = st.multiselect(
+            "Direct project access",
+            list(project_label_to_id.keys()),
+            default=current_project_labels,
+            key=f"profile_projects_{user_id}",
+            help="A user can access several projects. Group access is added on top of these selections.",
+        )
+
+        current_groups = _user_group_ids(service_client, user_id)
+        current_group_labels = [
+            label for label, gid in group_label_to_id.items() if gid in current_groups
+        ]
+        selected_group_labels = st.multiselect(
+            "Project groups",
+            list(group_label_to_id.keys()),
+            default=current_group_labels,
+            key=f"profile_groups_{user_id}",
+            help="Membership grants access to the project linked to each group.",
+        )
+
+        # Show the effective project list before the admin saves anything.
+        direct_project_ids = {project_label_to_id[label] for label in selected_project_labels}
+        selected_group_ids = {group_label_to_id[label] for label in selected_group_labels}
+        grouped_project_ids = {
+            group.get("project_id") for group in groups if group.get("id") in selected_group_ids
+        }
+        effective_project_ids = direct_project_ids | grouped_project_ids
+        effective_names = [
+            (project_by_id.get(pid) or {}).get("project_name", f"Project #{pid}")
+            for pid in sorted(effective_project_ids)
+        ]
+        st.info(
+            "Effective project access: "
+            + (", ".join(effective_names) if effective_names else "No projects assigned")
+        )
+
+        credentials_label = (
+            "Confirm master key"
+            if ACCESS_CONTEXT.get("mode") == "master"
+            else "Confirm your admin password"
+        )
+        safety_secret = st.text_input(
+            credentials_label,
+            type="password",
+            key=f"profile_safety_{user_id}",
+            help=(
+                "Fresh credentials are required before role, approval, active-state, "
+                "project or group access changes are applied."
+            ),
+        )
+
+        save_col, reset_col = st.columns([1, 5])
+        if save_col.button("Save user access", key=f"save_profile_{user_id}", type="primary"):
+            if not _verify_admin_safety_check(ACCESS_CONTEXT, safety_secret):
+                st.error("Safety check failed. Enter your current admin password or master key.")
+                return
+
+            service_client.table("user_profiles").update({
+                "role": new_role,
+                "approval_status": new_status,
+                "is_active": active,
+                "approved_at": (
+                    datetime.now(timezone.utc).isoformat() if new_status == "approved" else None
+                ),
+                "approved_by": CURRENT_ACTOR,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", user_id).execute()
+
+            desired_projects = {
+                project_label_to_id[label] for label in selected_project_labels
+            }
+            service_client.table("user_project_access").delete().eq("user_id", user_id).execute()
+            if desired_projects:
+                service_client.table("user_project_access").insert([
+                    {"user_id": user_id, "project_id": pid, "granted_by": CURRENT_ACTOR}
+                    for pid in sorted(desired_projects)
+                ]).execute()
+
+            desired_groups = {group_label_to_id[label] for label in selected_group_labels}
+            service_client.table("project_group_members").delete().eq("user_id", user_id).execute()
+            if desired_groups:
+                service_client.table("project_group_members").insert([
+                    {"user_id": user_id, "group_id": gid, "added_by": CURRENT_ACTOR}
+                    for gid in sorted(desired_groups)
+                ]).execute()
+
+            service_client.table("app_sessions").update({
+                "revoked_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("user_id", user_id).is_("revoked_at", "null").execute()
+            st.success("User access updated. Existing remembered sessions were revoked.")
+            st.rerun()
+
+        if reset_col.button("Reload saved access", key=f"reload_profile_{user_id}"):
+            # Clear this user's widget state so values are reconstructed from Supabase.
+            for prefix in (
+                "profile_role_", "profile_status_", "profile_active_",
+                "profile_projects_", "profile_groups_", "profile_safety_",
+            ):
+                st.session_state.pop(f"{prefix}{user_id}", None)
+            st.rerun()
 
 
 # ----------------------------------------------------------------------------
@@ -1138,14 +1551,19 @@ def list_imports(supabase, project_id=None):
     return res.data or []
 
 
-def list_projects(supabase):
-    res = (
+def list_projects(supabase, access_context=None):
+    query = (
         supabase.table("projects")
         .select("*")
         .eq("is_active", True)
-        .order("created_at", desc=True)
-        .execute()
     )
+    if access_context is not None:
+        allowed = accessible_project_ids(supabase, access_context)
+        if allowed is not None:
+            if not allowed:
+                return []
+            query = query.in_("id", sorted(allowed))
+    res = query.order("created_at", desc=True).execute()
     return res.data or []
 
 
@@ -1687,8 +2105,8 @@ def _find_revision_block(ws, row_number, revision, revision_blocks):
 
 
 def generate_updated_workbook(supabase, import_id):
-    if not globals().get("CAN_ADMIN", False):
-        raise PermissionError("Admin access is required to generate official workbook exports.")
+    if not globals().get("CAN_EXPORT", False):
+        raise PermissionError("An approved Viewer, Editor, Admin, or Master account is required to export workbooks.")
     import openpyxl
 
     meta = get_import_meta(supabase, import_id)
@@ -2232,6 +2650,7 @@ if supabase is None:
 ACCESS_CONTEXT = render_auth_gate(supabase)
 CAN_EDIT = _can_edit(ACCESS_CONTEXT)
 CAN_ADMIN = _can_admin(ACCESS_CONTEXT)
+CAN_EXPORT = _can_export(ACCESS_CONTEXT)
 CURRENT_ACTOR = _actor_label(ACCESS_CONTEXT)
 
 # ----------------------------------------------------------------------------
@@ -2254,7 +2673,7 @@ def render_project_home(supabase):
         with st.expander("👥 User Access Management", expanded=False):
             render_user_management(supabase)
 
-    projects = list_projects(supabase)
+    projects = list_projects(supabase, ACCESS_CONTEXT)
     if projects:
         st.subheader("Projects")
         cards_per_row = 3
@@ -2284,7 +2703,10 @@ def render_project_home(supabase):
                         _clear_pending_upload()
                         st.rerun()
     else:
-        st.info("No projects exist yet. Create the first project below.")
+        if CAN_ADMIN:
+            st.info("No projects exist yet. Create the first project below.")
+        else:
+            st.warning("Your account is approved, but no project has been assigned to you yet. Contact an administrator.")
 
     st.markdown("---")
     if not CAN_ADMIN:
@@ -2373,7 +2795,7 @@ def render_project_home(supabase):
 
 
 try:
-    _available_projects = list_projects(supabase)
+    _available_projects = list_projects(supabase, ACCESS_CONTEXT)
 except Exception as exc:
     st.error("The multi-project database migration has not been applied yet.")
     st.code(str(exc))
@@ -2396,6 +2818,12 @@ if not active_project:
     st.session_state.pop("active_project_id", None)
     st.session_state["show_project_home"] = True
     st.rerun()
+_allowed_project_ids = accessible_project_ids(supabase, ACCESS_CONTEXT)
+if _allowed_project_ids is not None and active_project_id not in _allowed_project_ids:
+    st.session_state.pop("active_project_id", None)
+    st.session_state["show_project_home"] = True
+    st.error("You no longer have access to that project.")
+    st.rerun()
 
 # ----------------------------------------------------------------------------
 # SIDEBAR
@@ -2409,7 +2837,7 @@ if st.sidebar.button("Sign out", use_container_width=True):
             auth_client.auth.sign_out()
     except Exception:
         pass
-    _clear_access_session()
+    _clear_access_session(supabase)
     st.rerun()
 if st.sidebar.button("← Project Home", use_container_width=True):
     st.session_state["show_project_home"] = True
@@ -3276,7 +3704,7 @@ try:
     # ------------------------------------------------------------------
     with tabs[11]:
         if not CAN_ADMIN:
-            st.warning("Import and official export are available to Admin and Master users only.")
+            st.info("Import is restricted to Admin and Master users. Export is available below.")
         else:
             st.subheader("Import")
 
@@ -3401,54 +3829,53 @@ try:
                 except Exception as ex:
                     st.error(f"Could not read this workbook: {ex}")
 
-            st.markdown("---")
-            st.subheader("Export")
+        st.markdown("---")
+        st.subheader("Export")
 
-            if not active_import_id:
-                st.caption("No active workbook to export.")
-            else:
-                ec1, ec2 = st.columns(2)
-                with ec1:
-                    if st.button("Generate Updated Workbook (.xlsx)"):
-                        with st.spinner("Regenerating workbook from current data..."):
-                            try:
-                                wb_bytes, wb_filename = generate_updated_workbook(supabase, active_import_id)
-                                record_export(supabase, active_import_id, "workbook", wb_filename, len(df))
-                                st.download_button(
-                                    "Download Updated Workbook", data=wb_bytes, file_name=wb_filename,
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                )
-                            except Exception as ex:
-                                st.error(f"Export failed: {ex}")
-                with ec2:
-                    if has_data:
-                        all_history_rows = get_history_for_documents(supabase, df["document_id"].dropna().unique().tolist())
-                        if all_history_rows:
-                            hist_csv = pd.DataFrame(all_history_rows).to_csv(index=False).encode("utf-8")
+        if not active_import_id:
+            st.caption("No active workbook to export.")
+        else:
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                if st.button("Generate Updated Workbook (.xlsx)"):
+                    with st.spinner("Regenerating workbook from current data..."):
+                        try:
+                            wb_bytes, wb_filename = generate_updated_workbook(supabase, active_import_id)
+                            record_export(supabase, active_import_id, "workbook", wb_filename, len(df))
                             st.download_button(
-                                "Download History Report (CSV)", data=hist_csv,
-                                file_name=f"dci_history_report_{datetime.now().strftime('%Y-%m-%d')}.csv",
-                                mime="text/csv",
+                                "Download Updated Workbook", data=wb_bytes, file_name=wb_filename,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             )
-                        else:
-                            st.caption("No history events recorded yet.")
-
+                        except Exception as ex:
+                            st.error(f"Export failed: {ex}")
+            with ec2:
                 if has_data:
-                    filtered_csv = filtered.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "Download Filtered Document Register (CSV)", data=filtered_csv,
-                        file_name=f"dci_filtered_register_{datetime.now().strftime('%Y-%m-%d')}.csv",
-                        mime="text/csv",
-                    )
+                    all_history_rows = get_history_for_documents(supabase, df["document_id"].dropna().unique().tolist())
+                    if all_history_rows:
+                        hist_csv = pd.DataFrame(all_history_rows).to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "Download History Report (CSV)", data=hist_csv,
+                            file_name=f"dci_history_report_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                            mime="text/csv",
+                        )
+                    else:
+                        st.caption("No history events recorded yet.")
 
-                st.markdown("#### Previous Exports")
-                exp_res = supabase.table("export_records").select("*").eq("import_id", active_import_id) \
-                    .order("exported_at", desc=True).limit(20).execute()
-                if exp_res.data:
-                    st.dataframe(pd.DataFrame(exp_res.data), use_container_width=True, hide_index=True)
-                else:
-                    st.caption("No exports recorded yet for this workbook.")
+            if has_data:
+                filtered_csv = filtered.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download Filtered Document Register (CSV)", data=filtered_csv,
+                    file_name=f"dci_filtered_register_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                    mime="text/csv",
+                )
 
+            st.markdown("#### Previous Exports")
+            exp_res = supabase.table("export_records").select("*").eq("import_id", active_import_id) \
+                .order("exported_at", desc=True).limit(20).execute()
+            if exp_res.data:
+                st.dataframe(pd.DataFrame(exp_res.data), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No exports recorded yet for this workbook.")
 except Exception as e:
     st.error(
         "Something went wrong while rendering the dashboard tabs. "
