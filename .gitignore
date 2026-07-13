@@ -1,1 +1,12 @@
+.venv/
+venv/
+
+__pycache__/
+*.pyc
+*.pyo
+
+.env
 .streamlit/secrets.toml
+
+.idea/
+.vscode/settings.json
