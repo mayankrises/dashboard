@@ -2955,8 +2955,6 @@ if has_data:
         filtered = filtered[filtered["status_clean"].isin(f_status)]
     if f_code:
         filtered = filtered[filtered["code_bucket"].isin(f_code)]
-    if f_revision:
-        filtered = filtered[filtered["latest_rev_display"].isin(f_revision)]
     if f_aging:
         filtered = filtered[filtered["aging_bucket"].isin(f_aging)]
     if search:
@@ -2971,6 +2969,15 @@ if has_data:
         if include_undated:
             date_match = date_match | filtered["latest_uploaded_date"].isna()
         filtered = filtered[date_match]
+
+    # Keep a copy with every active filter except Revision. The Delays & Aging
+    # tab uses this to draw one independent chart per selected revision instead
+    # of merging the selected revisions into one cumulative chart.
+    revision_comparison_base = filtered.copy()
+    if f_revision:
+        filtered = filtered[filtered["latest_rev_display"].isin(f_revision)]
+else:
+    revision_comparison_base = filtered.copy()
 
 filtered_doc_numbers = set(filtered["doc_no"]) if has_data else set()
 filtered_hist = hist[hist["doc_no"].isin(filtered_doc_numbers)].copy() if has_data else hist
@@ -3296,10 +3303,169 @@ try:
         else:
             open_docs = filtered[~filtered["is_approved_final"] & ~filtered["is_void"]]
             st.subheader("Aging Buckets (open documents)")
-            bucket_counts = open_docs["aging_bucket"].value_counts().reindex(AGING_BUCKET_ORDER).fillna(0).reset_index()
-            bucket_counts.columns = ["Aging Bucket", "Count"]
-            fig = px.bar(bucket_counts, x="Aging Bucket", y="Count", text="Count", title="Open Documents by Aging Bucket")
-            st.plotly_chart(fig, use_container_width=True)
+
+            show_not_due_yet = st.checkbox(
+                "Show Not Due Yet",
+                value=True,
+                key="show_not_due_yet_aging_charts",
+                help="Show or hide the Not due yet bucket in every aging chart.",
+            )
+
+            displayed_bucket_order = [
+                bucket for bucket in AGING_BUCKET_ORDER
+                if show_not_due_yet or bucket != "Not due yet"
+            ]
+            aging_bucket_colors = {
+                "Not due yet": "#94A3B8",
+                "0-7 days": "#EF4444",
+                "8-14 days": "#3B82F6",
+                "15-21 days": "#F59E0B",
+                ">21 days": "#7C3AED",
+            }
+
+            # Every selected revision gets its own chart. All other sidebar filters
+            # remain active, but revisions are never combined into one bar chart.
+            if f_revision:
+                aging_chart_groups = [
+                    (str(revision), revision_comparison_base[
+                        revision_comparison_base["latest_rev_display"] == revision
+                    ])
+                    for revision in f_revision
+                ]
+            else:
+                aging_chart_groups = [("All revisions", revision_comparison_base)]
+
+            prepared_charts = []
+            shared_y_max = 0
+            for revision_label, revision_df in aging_chart_groups:
+                revision_open_docs = revision_df[
+                    ~revision_df["is_approved_final"] & ~revision_df["is_void"]
+                ]
+                counts = (
+                    revision_open_docs["aging_bucket"]
+                    .value_counts()
+                    .reindex(displayed_bucket_order)
+                    .fillna(0)
+                    .astype(int)
+                    .reset_index()
+                )
+                counts.columns = ["Aging Bucket", "Count"]
+                shared_y_max = max(
+                    shared_y_max,
+                    int(counts["Count"].max()) if not counts.empty else 0,
+                )
+                prepared_charts.append((revision_label, revision_open_docs, counts))
+
+            # A common y-axis keeps the visual comparison honest.
+            shared_y_upper = max(1, int(shared_y_max * 1.18) + 1)
+
+            import html as _html
+            import plotly.io as pio
+
+            chart_cards = []
+            for chart_index, (revision_label, revision_open_docs, counts) in enumerate(prepared_charts):
+                fig = px.bar(
+                    counts,
+                    x="Aging Bucket",
+                    y="Count",
+                    text="Count",
+                    category_orders={"Aging Bucket": displayed_bucket_order},
+                )
+                fig.update_traces(
+                    marker_color=[aging_bucket_colors[b] for b in counts["Aging Bucket"]],
+                    textposition="outside",
+                    cliponaxis=False,
+                    hovertemplate="%{x}<br>Documents: %{y}<extra></extra>",
+                )
+                fig.update_layout(
+                    height=360,
+                    margin=dict(l=38, r=20, t=18, b=70),
+                    showlegend=False,
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    bargap=0.32,
+                    yaxis=dict(
+                        title="Documents",
+                        range=[0, shared_y_upper],
+                        gridcolor="rgba(148,163,184,0.22)",
+                        zeroline=False,
+                        fixedrange=True,
+                    ),
+                    xaxis=dict(title="", fixedrange=True),
+                    font=dict(size=12),
+                )
+                chart_html = pio.to_html(
+                    fig,
+                    full_html=False,
+                    include_plotlyjs=True if chart_index == 0 else False,
+                    config={"displayModeBar": False, "responsive": True},
+                )
+                safe_label = _html.escape(revision_label)
+                chart_cards.append(
+                    f"""
+                    <section class="aging-chart-card">
+                        <div class="aging-chart-heading">
+                            <div>Revision: <strong>{safe_label}</strong></div>
+                            <span>{len(revision_open_docs):,} open documents</span>
+                        </div>
+                        {chart_html}
+                    </section>
+                    """
+                )
+
+            comparison_hint = (
+                "Scroll horizontally to compare every selected revision."
+                if len(chart_cards) > 2
+                else "Each selected revision is displayed independently."
+            )
+            components.html(
+                f"""
+                <style>
+                    * {{ box-sizing: border-box; }}
+                    body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+                    .aging-comparison-note {{
+                        margin: 0 0 8px 2px; color: #64748B; font-size: 13px;
+                    }}
+                    .aging-chart-strip {{
+                        display: flex; flex-wrap: nowrap; gap: 16px; overflow-x: auto;
+                        padding: 4px 4px 14px; scroll-behavior: smooth;
+                        scrollbar-width: thin; scrollbar-color: #94A3B8 transparent;
+                        scroll-snap-type: x proximity;
+                    }}
+                    .aging-chart-strip::-webkit-scrollbar {{ height: 9px; }}
+                    .aging-chart-strip::-webkit-scrollbar-thumb {{
+                        background: #94A3B8; border-radius: 999px;
+                    }}
+                    .aging-chart-card {{
+                        flex: 1 0 min(520px, calc(100vw - 28px));
+                        min-width: min(520px, calc(100vw - 28px));
+                        max-width: 620px; background: #FFFFFF;
+                        border: 1px solid #E2E8F0; border-radius: 14px;
+                        padding: 14px 14px 2px; box-shadow: 0 3px 12px rgba(15,23,42,0.07);
+                        scroll-snap-align: start;
+                    }}
+                    .aging-chart-heading {{
+                        display: flex; justify-content: space-between; align-items: center; gap: 12px;
+                        color: #0F172A; font-size: 17px; padding: 2px 4px 0;
+                    }}
+                    .aging-chart-heading span {{
+                        color: #475569; font-size: 12px; white-space: nowrap;
+                        background: #F1F5F9; border-radius: 999px; padding: 5px 9px;
+                    }}
+                    @media (max-width: 640px) {{
+                        .aging-chart-card {{
+                            flex-basis: calc(100vw - 24px);
+                            min-width: calc(100vw - 24px);
+                        }}
+                        .aging-chart-heading {{ align-items: flex-start; flex-direction: column; gap: 5px; }}
+                    }}
+                </style>
+                <div class="aging-comparison-note">{comparison_hint}</div>
+                <div class="aging-chart-strip">{''.join(chart_cards)}</div>
+                """,
+                height=455,
+                scrolling=False,
+            )
 
             m = st.columns(3)
             m[0].metric("Total open (pending) documents", len(open_docs))
